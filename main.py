@@ -2,22 +2,34 @@ import os
 import psycopg2
 from fastapi import FastAPI
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Read DATABASE_URL from environment and strip any whitespace/newlines
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 app = FastAPI()
 
 
 def get_connection():
+    """
+    Open a new connection to the Postgres database using DATABASE_URL.
+    """
     return psycopg2.connect(DATABASE_URL)
 
 
 @app.get("/health")
 def health():
+    """
+    Simple health check to confirm the API is running.
+    """
     return {"status": "ok"}
 
 
 @app.get("/db-check")
 def db_check():
+    """
+    Check database connectivity by running SELECT NOW().
+    """
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -78,7 +90,7 @@ def init_db():
     """
     try:
         conn = get_connection()
-        conn.autocommit = True  # allow multiple CREATEs in one go
+        conn.autocommit = True  # allow multiple CREATE statements in one go
         cur = conn.cursor()
         cur.execute(schema_sql)
         cur.close()
@@ -86,4 +98,3 @@ def init_db():
         return {"status": "ok", "detail": "Tables created (or already existed)."}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
-
