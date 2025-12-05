@@ -2,17 +2,38 @@ import os
 import psycopg2
 from fastapi import FastAPI
 
-# Read DATABASE_URL from environment and strip any whitespace/newlines
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+def build_clean_database_url() -> str:
+    """
+    Read DATABASE_URL from the environment, strip whitespace/newlines,
+    and normalize sslmode so we always end with '?sslmode=require'.
+    Any existing '?sslmode=...' in the URL is removed first.
+    """
+    raw = os.getenv("DATABASE_URL", "")
+    raw = raw.strip()  # remove leading/trailing spaces/newlines
+
+    if not raw:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    # If there's already a ?sslmode=... or other query, strip it off
+    if "?sslmode=" in raw:
+        raw = raw.split("?sslmode=")[0]
+    elif "?" in raw:
+        # Strip any other query parameters entirely
+        raw = raw.split("?", 1)[0]
+
+    # Append the correct sslmode parameter
+    clean = raw + "?sslmode=require"
+    return clean
+
+
+DATABASE_URL = build_clean_database_url()
 
 app = FastAPI()
 
 
 def get_connection():
     """
-    Open a new connection to the Postgres database using DATABASE_URL.
+    Open a new connection to the Postgres database using the cleaned DATABASE_URL.
     """
     return psycopg2.connect(DATABASE_URL)
 
