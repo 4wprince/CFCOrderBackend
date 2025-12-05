@@ -1,26 +1,33 @@
 """
-CFC Order Workflow Backend - v4
-Added: address, contact info, order total, tracking
-
+CFC Order Workflow Backend - v5
+All parsing/logic server-side. Google Sheet is just a display layer.
 """
 
 import os
+import re
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional, List
 from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-app = FastAPI(
-    title="CFC Order Workflow API",
-    description="6-Checkpoint Order Tracking System",
-    version="4.0.0"
-)
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if DATABASE_URL and "sslmode" not in DATABASE_URL:
+    DATABASE_URL += "?sslmode=require"
+
+app = FastAPI(title="CFC Order Workflow", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,522 +38,782 @@ app.add_middleware(
 )
 
 # =============================================================================
-# DATABASE CONNECTION
+# DATABASE
 # =============================================================================
 
-def get_database_url():
-    raw_url = os.environ.get("DATABASE_URL", "")
-    url = raw_url.strip()
-    if "sslmode=" in url:
-        url = url.split("?")[0] + "?sslmode=require"
-    else:
-        url = url + "?sslmode=require"
-    return url
-
 @contextmanager
-def get_db_connection():
-    conn = None
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        conn = psycopg2.connect(get_database_url())
         yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        if conn:
-            conn.close()
-
-@contextmanager
-def get_db_cursor(commit=True):
-    with get_db_connection() as conn:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            yield cursor
-            if commit:
-                conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cursor.close()
-
-# =============================================================================
-# PYDANTIC MODELS
-# =============================================================================
-
-class OrderCreate(BaseModel):
-    order_id: str
-    customer_name: Optional[str] = None
-    order_date: Optional[datetime] = None
-    email_thread_id: Optional[str] = None
-    order_total: Optional[float] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    street: Optional[str] = None
-    suite: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    zip_code: Optional[str] = None
-    comments: Optional[str] = None
-    source: Optional[str] = "manual"
-
-class CheckpointUpdate(BaseModel):
-    checkpoint: str
-    value: bool = True
-    timestamp: Optional[datetime] = None
-    source: Optional[str] = "manual"
-    data: Optional[dict] = None
-
-class OrderUpdate(BaseModel):
-    customer_name: Optional[str] = None
-    order_total: Optional[float] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    street: Optional[str] = None
-    suite: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    zip_code: Optional[str] = None
-    comments: Optional[str] = None
-    supplier: Optional[str] = None
-    supplier_order_no: Optional[str] = None
-    tracking: Optional[str] = None
-    notes: Optional[str] = None
-
-# =============================================================================
-# HEALTH & DIAGNOSTICS
-# =============================================================================
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "version": "4.0.0"}
-
-@app.get("/db-check")
-def db_check():
-    try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT NOW()")
-            result = cur.fetchone()
-            return {"db_status": "ok", "time": str(result["now"])}
-    except Exception as e:
-        return {"db_status": "error", "detail": str(e)}
-
-# =============================================================================
-# SCHEMA
-# =============================================================================
+        conn.close()
 
 SCHEMA_SQL = """
-DROP TABLE IF EXISTS events CASCADE;
+-- Orders table
+DROP TABLE IF EXISTS order_line_items CASCADE;
+DROP TABLE IF EXISTS order_events CASCADE;
 DROP TABLE IF EXISTS orders CASCADE;
+DROP TABLE IF EXISTS warehouse_mapping CASCADE;
+
+CREATE TABLE warehouse_mapping (
+    sku_prefix VARCHAR(20) PRIMARY KEY,
+    warehouse_name VARCHAR(100) NOT NULL,
+    warehouse_code VARCHAR(20),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Default warehouse mappings
+INSERT INTO warehouse_mapping (sku_prefix, warehouse_name, warehouse_code) VALUES
+('WSP', 'Cabinet & Stone', 'LI'),
+('GSP', 'Gobravura', 'GOB'),
+('AKS', 'GHI', 'GHI'),
+('DL', 'DL Cabinetry', 'DL'),
+('DS', 'Durastone', 'DS'),
+('ROC', 'ROC Cabinetry', 'ROC'),
+('GHI', 'GHI', 'GHI'),
+('LC', 'L&C Cabinetry', 'LC'),
+('HSS', 'Cabinet & Stone', 'LI'),
+('NSN', 'Cabinet & Stone', 'LI'),
+('?"', 'Cabinet & Stone', 'LI'),
+('SHLS', 'Cabinet & Stone', 'LI'),
+('WWW', 'LOVE', 'LOVE')
+ON CONFLICT (sku_prefix) DO NOTHING;
 
 CREATE TABLE orders (
     order_id VARCHAR(20) PRIMARY KEY,
+    
+    -- Customer info
     customer_name VARCHAR(255),
-    order_date TIMESTAMP WITH TIME ZONE,
-    email_thread_id VARCHAR(100),
-    
-    -- Order details
-    order_total DECIMAL(10,2),
-    
-    -- Contact info
+    company_name VARCHAR(255),
     email VARCHAR(255),
     phone VARCHAR(50),
     
     -- Address
     street VARCHAR(255),
-    suite VARCHAR(100),
     city VARCHAR(100),
     state VARCHAR(50),
     zip_code VARCHAR(20),
     
-    -- Customer comments from order
+    -- Order details
+    order_date TIMESTAMP WITH TIME ZONE,
+    order_total DECIMAL(10,2),
     comments TEXT,
     
-    -- Supplier info (can have multiple - stored as JSON for flexibility)
-    supplier VARCHAR(50),
-    supplier_order_no VARCHAR(50),
-    suppliers JSONB,  -- [{name, order_no}, ...]
+    -- Warehouses (extracted from SKU prefixes)
+    warehouse_1 VARCHAR(100),
+    warehouse_2 VARCHAR(100),
     
-    -- Tracking
-    tracking VARCHAR(255),
-    
-    -- 6 Checkpoints
+    -- Payment
     payment_link_sent BOOLEAN DEFAULT FALSE,
     payment_link_sent_at TIMESTAMP WITH TIME ZONE,
-    
     payment_received BOOLEAN DEFAULT FALSE,
     payment_received_at TIMESTAMP WITH TIME ZONE,
+    payment_amount DECIMAL(10,2),
+    shipping_cost DECIMAL(10,2),
     
+    -- Warehouse processing
     sent_to_warehouse BOOLEAN DEFAULT FALSE,
     sent_to_warehouse_at TIMESTAMP WITH TIME ZONE,
-    
     warehouse_confirmed BOOLEAN DEFAULT FALSE,
     warehouse_confirmed_at TIMESTAMP WITH TIME ZONE,
+    supplier_order_no VARCHAR(100),
     
+    -- Shipping
     bol_sent BOOLEAN DEFAULT FALSE,
     bol_sent_at TIMESTAMP WITH TIME ZONE,
+    tracking VARCHAR(255),
     
+    -- Completion
     is_complete BOOLEAN DEFAULT FALSE,
     completed_at TIMESTAMP WITH TIME ZONE,
     
-    -- Notes (internal)
+    -- Meta
+    email_thread_id VARCHAR(255),
     notes TEXT,
-    
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_orders_order_date ON orders(order_date DESC);
-CREATE INDEX idx_orders_is_complete ON orders(is_complete);
+CREATE TABLE order_line_items (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    sku VARCHAR(100),
+    sku_prefix VARCHAR(20),
+    product_name TEXT,
+    price DECIMAL(10,2),
+    quantity INTEGER,
+    line_total DECIMAL(10,2),
+    warehouse VARCHAR(100)
+);
 
-CREATE TABLE events (
+CREATE TABLE order_events (
     event_id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) NOT NULL REFERENCES orders(order_id) ON DELETE CASCADE,
+    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
     event_type VARCHAR(50) NOT NULL,
     event_data JSONB,
-    source VARCHAR(50) DEFAULT 'manual',
+    source VARCHAR(50),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_events_order_id ON events(order_id);
+CREATE INDEX idx_orders_complete ON orders(is_complete);
+CREATE INDEX idx_orders_date ON orders(order_date DESC);
+CREATE INDEX idx_line_items_order ON order_line_items(order_id);
+CREATE INDEX idx_events_order ON order_events(order_id);
 
--- Status view
-CREATE OR REPLACE VIEW order_status_summary AS
+-- View for current status
+CREATE OR REPLACE VIEW order_status AS
 SELECT 
     order_id,
-    customer_name,
-    order_date,
-    order_total,
-    email,
-    phone,
-    street,
-    suite,
-    city,
-    state,
-    zip_code,
-    comments,
-    supplier,
-    supplier_order_no,
-    suppliers,
-    tracking,
-    CASE 
+    CASE
         WHEN is_complete THEN 'complete'
-        WHEN bol_sent THEN 'awaiting_shipment'
-        WHEN warehouse_confirmed THEN 'needs_bol'
-        WHEN sent_to_warehouse THEN 'awaiting_warehouse'
-        WHEN payment_received THEN 'needs_warehouse_order'
-        WHEN payment_link_sent THEN 'awaiting_payment'
+        WHEN bol_sent AND NOT is_complete THEN 'awaiting_shipment'
+        WHEN warehouse_confirmed AND NOT bol_sent THEN 'needs_bol'
+        WHEN sent_to_warehouse AND NOT warehouse_confirmed THEN 'awaiting_warehouse'
+        WHEN payment_received AND NOT sent_to_warehouse THEN 'needs_warehouse_order'
+        WHEN payment_link_sent AND NOT payment_received THEN 'awaiting_payment'
         ELSE 'needs_payment_link'
-    END AS current_status,
-    EXTRACT(DAY FROM NOW() - order_date)::INT AS days_open,
-    payment_link_sent,
-    payment_received,
-    sent_to_warehouse,
-    warehouse_confirmed,
-    bol_sent,
-    is_complete,
-    notes,
-    created_at,
-    updated_at
-FROM orders
-ORDER BY order_date DESC;
+    END as current_status,
+    EXTRACT(DAY FROM NOW() - order_date)::INTEGER as days_open
+FROM orders;
 """
 
+# =============================================================================
+# PYDANTIC MODELS
+# =============================================================================
+
+class ParseEmailRequest(BaseModel):
+    email_body: str
+    email_subject: str
+    email_date: Optional[str] = None
+    email_thread_id: Optional[str] = None
+
+class ParseEmailResponse(BaseModel):
+    status: str
+    order_id: Optional[str]
+    parsed_data: Optional[dict]
+    warehouses: Optional[List[str]]
+    message: Optional[str]
+
+class OrderUpdate(BaseModel):
+    customer_name: Optional[str] = None
+    company_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    street: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+    order_total: Optional[float] = None
+    comments: Optional[str] = None
+    notes: Optional[str] = None
+    tracking: Optional[str] = None
+    supplier_order_no: Optional[str] = None
+    warehouse_1: Optional[str] = None
+    warehouse_2: Optional[str] = None
+
+class CheckpointUpdate(BaseModel):
+    checkpoint: str  # payment_link_sent, payment_received, sent_to_warehouse, warehouse_confirmed, bol_sent, is_complete
+    source: Optional[str] = "api"
+    payment_amount: Optional[float] = None
+
+class WarehouseMappingUpdate(BaseModel):
+    sku_prefix: str
+    warehouse_name: str
+    warehouse_code: Optional[str] = None
+
+# =============================================================================
+# EMAIL PARSING (SERVER-SIDE)
+# =============================================================================
+
+def parse_b2bwave_email(body: str, subject: str) -> dict:
+    """
+    Parse B2BWave order email and extract all fields.
+    Returns dict with: order_id, name, company, street, city, state, zip, phone, email, comments, total, line_items
+    """
+    result = {
+        'order_id': None,
+        'customer_name': None,
+        'company_name': None,
+        'street': None,
+        'city': None,
+        'state': None,
+        'zip_code': None,
+        'phone': None,
+        'email': None,
+        'comments': None,
+        'order_total': None,
+        'line_items': []
+    }
+    
+    # Extract order ID from subject: "Order Legendary Home Improvements-(#5261)"
+    subject_match = re.search(r'\(#(\d{4,7})\)', subject)
+    if subject_match:
+        result['order_id'] = subject_match.group(1)
+    
+    # Also try from body
+    if not result['order_id']:
+        order_id_match = re.search(r'Order ID:\s*(\d{4,7})', body)
+        if order_id_match:
+            result['order_id'] = order_id_match.group(1)
+    
+    # Extract Name
+    name_match = re.search(r'Name:\s*(.+?)(?:\n|$)', body)
+    if name_match:
+        result['customer_name'] = name_match.group(1).strip()
+    
+    # Extract Company
+    company_match = re.search(r'Company:\s*(.+?)(?:\n|$)', body)
+    if company_match:
+        result['company_name'] = company_match.group(1).strip()
+    
+    # Extract Phone (format: "Phone 352-665-0280" or "Phone: 352-665-0280")
+    phone_match = re.search(r'Phone[:\s]+(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})', body)
+    if phone_match:
+        result['phone'] = phone_match.group(1).replace('.', '-').replace(' ', '-')
+    
+    # Extract Email
+    email_match = re.search(r'Email:\s*([\w.-]+@[\w.-]+\.\w+)', body)
+    if email_match:
+        result['email'] = email_match.group(1).lower()
+    
+    # Extract Comments
+    comments_match = re.search(r'Comments:\s*(.+?)(?:\n|Total:|$)', body, re.DOTALL)
+    if comments_match:
+        result['comments'] = comments_match.group(1).strip()
+    
+    # Extract Total
+    total_match = re.search(r'Total:\s*\$?([\d,]+\.?\d*)', body)
+    if total_match:
+        result['order_total'] = float(total_match.group(1).replace(',', ''))
+    
+    # Extract Address - B2BWave format:
+    # Company name line
+    # Street address line (starts with number)
+    # City  State  Zip (double spaces between parts)
+    # Phone line
+    
+    lines = body.split('\n')
+    for i, line in enumerate(lines):
+        line = line.strip()
+        
+        # Look for street address (starts with number, not "Phone" line)
+        if re.match(r'^\d+\s+\w', line) and 'phone' not in line.lower():
+            result['street'] = line
+            
+            # Next line should be city/state/zip
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                
+                # Skip if next line is Phone
+                if next_line.lower().startswith('phone'):
+                    # City/state/zip might be on same line as street - check for pattern
+                    continue
+                
+                # Parse "Keystone Heights  FL  32656" format
+                # Could have single or double spaces
+                csz_match = re.match(r'^(.+?)\s{2,}([A-Z]{2})\s{2,}(\d{5}(?:-\d{4})?)$', next_line)
+                if csz_match:
+                    result['city'] = csz_match.group(1).strip()
+                    result['state'] = csz_match.group(2)
+                    result['zip_code'] = csz_match.group(3)
+                else:
+                    # Try single space format: "City State Zip" or "City, State Zip"
+                    csz_match2 = re.match(r'^([A-Za-z\s]+?)[,\s]+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$', next_line)
+                    if csz_match2:
+                        result['city'] = csz_match2.group(1).strip().rstrip(',')
+                        result['state'] = csz_match2.group(2)
+                        result['zip_code'] = csz_match2.group(3)
+            break
+    
+    # Extract SKU codes for warehouse mapping
+    # Look for patterns like HSS-3VDB15, NSN-SM8, SHLS-B09
+    sku_pattern = re.findall(r'\b([A-Z]{2,5})-[A-Z0-9]+\b', body)
+    sku_prefixes = list(set(sku_pattern))
+    result['sku_prefixes'] = sku_prefixes
+    
+    return result
+
+def get_warehouses_for_skus(sku_prefixes: List[str]) -> List[str]:
+    """Look up warehouse names for given SKU prefixes"""
+    if not sku_prefixes:
+        return []
+    
+    warehouses = []
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            placeholders = ','.join(['%s'] * len(sku_prefixes))
+            cur.execute(f"""
+                SELECT DISTINCT warehouse_name 
+                FROM warehouse_mapping 
+                WHERE sku_prefix IN ({placeholders})
+            """, sku_prefixes)
+            warehouses = [row['warehouse_name'] for row in cur.fetchall()]
+    
+    return warehouses
+
+# =============================================================================
+# ROUTES
+# =============================================================================
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "CFC Order Workflow", "version": "5.0.0"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "5.0.0"}
+
 @app.post("/init-db")
-def init_database():
-    try:
-        with get_db_cursor() as cur:
+def init_db():
+    """Initialize database schema (destructive!)"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-        return {"status": "ok", "detail": "Database schema v4 initialized."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.0.0"}
+
+# =============================================================================
+# EMAIL PARSING ENDPOINT
+# =============================================================================
+
+@app.post("/parse-email", response_model=ParseEmailResponse)
+def parse_email(request: ParseEmailRequest):
+    """
+    Parse a B2BWave order email and create/update the order.
+    This is the main entry point - Google Sheet just sends raw email here.
+    """
+    parsed = parse_b2bwave_email(request.email_body, request.email_subject)
+    
+    if not parsed['order_id']:
+        return ParseEmailResponse(
+            status="error",
+            message="Could not extract order ID from email"
+        )
+    
+    # Get warehouses from SKU prefixes
+    warehouses = get_warehouses_for_skus(parsed.get('sku_prefixes', []))
+    
+    # Create or update order
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Check if order exists
+            cur.execute("SELECT order_id FROM orders WHERE order_id = %s", (parsed['order_id'],))
+            exists = cur.fetchone()
+            
+            if exists:
+                # Update existing order (don't overwrite checkpoints)
+                cur.execute("""
+                    UPDATE orders SET
+                        customer_name = COALESCE(%s, customer_name),
+                        company_name = COALESCE(%s, company_name),
+                        email = COALESCE(%s, email),
+                        phone = COALESCE(%s, phone),
+                        street = COALESCE(%s, street),
+                        city = COALESCE(%s, city),
+                        state = COALESCE(%s, state),
+                        zip_code = COALESCE(%s, zip_code),
+                        order_total = COALESCE(%s, order_total),
+                        comments = COALESCE(%s, comments),
+                        warehouse_1 = COALESCE(%s, warehouse_1),
+                        warehouse_2 = COALESCE(%s, warehouse_2),
+                        updated_at = NOW()
+                    WHERE order_id = %s
+                """, (
+                    parsed['customer_name'],
+                    parsed['company_name'],
+                    parsed['email'],
+                    parsed['phone'],
+                    parsed['street'],
+                    parsed['city'],
+                    parsed['state'],
+                    parsed['zip_code'],
+                    parsed['order_total'],
+                    parsed['comments'],
+                    warehouses[0] if len(warehouses) > 0 else None,
+                    warehouses[1] if len(warehouses) > 1 else None,
+                    parsed['order_id']
+                ))
+                
+                return ParseEmailResponse(
+                    status="updated",
+                    order_id=parsed['order_id'],
+                    parsed_data=parsed,
+                    warehouses=warehouses,
+                    message="Order updated"
+                )
+            else:
+                # Create new order
+                order_date = request.email_date or datetime.now(timezone.utc).isoformat()
+                
+                cur.execute("""
+                    INSERT INTO orders (
+                        order_id, customer_name, company_name, email, phone,
+                        street, city, state, zip_code,
+                        order_date, order_total, comments,
+                        warehouse_1, warehouse_2, email_thread_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    parsed['order_id'],
+                    parsed['customer_name'],
+                    parsed['company_name'],
+                    parsed['email'],
+                    parsed['phone'],
+                    parsed['street'],
+                    parsed['city'],
+                    parsed['state'],
+                    parsed['zip_code'],
+                    order_date,
+                    parsed['order_total'],
+                    parsed['comments'],
+                    warehouses[0] if len(warehouses) > 0 else None,
+                    warehouses[1] if len(warehouses) > 1 else None,
+                    request.email_thread_id
+                ))
+                
+                # Log event
+                cur.execute("""
+                    INSERT INTO order_events (order_id, event_type, event_data, source)
+                    VALUES (%s, 'order_created', %s, 'email_parse')
+                """, (parsed['order_id'], json.dumps(parsed)))
+                
+                return ParseEmailResponse(
+                    status="created",
+                    order_id=parsed['order_id'],
+                    parsed_data=parsed,
+                    warehouses=warehouses,
+                    message="Order created"
+                )
+
+# =============================================================================
+# PAYMENT DETECTION ENDPOINTS
+# =============================================================================
+
+@app.post("/detect-payment-link")
+def detect_payment_link(order_id: str, email_body: str):
+    """Detect if email contains Square payment link"""
+    if 'square.link' in email_body.lower():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE orders SET 
+                        payment_link_sent = TRUE,
+                        payment_link_sent_at = NOW(),
+                        updated_at = NOW()
+                    WHERE order_id = %s AND NOT payment_link_sent
+                """, (order_id,))
+                
+                if cur.rowcount > 0:
+                    cur.execute("""
+                        INSERT INTO order_events (order_id, event_type, source)
+                        VALUES (%s, 'payment_link_sent', 'email_detection')
+                    """, (order_id,))
+                    return {"status": "ok", "updated": True}
+        
+        return {"status": "ok", "updated": False, "message": "Already marked"}
+    
+    return {"status": "ok", "updated": False, "message": "No square link found"}
+
+@app.post("/detect-payment-received")
+def detect_payment_received(email_subject: str, email_body: str):
+    """
+    Detect Square payment notification.
+    Subject format: "$4,913.99 payment received from Dylan Gentry"
+    """
+    # Extract amount from subject
+    amount_match = re.search(r'\$([\d,]+\.?\d*)\s+payment received', email_subject, re.IGNORECASE)
+    if not amount_match:
+        return {"status": "ok", "updated": False, "message": "Not a payment notification"}
+    
+    payment_amount = float(amount_match.group(1).replace(',', ''))
+    
+    # Extract customer name
+    name_match = re.search(r'payment received from (.+)$', email_subject, re.IGNORECASE)
+    customer_name = name_match.group(1).strip() if name_match else None
+    
+    # Try to match to an order
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # First try exact amount match on unpaid orders
+            cur.execute("""
+                SELECT order_id, order_total, customer_name 
+                FROM orders 
+                WHERE NOT payment_received 
+                AND order_total IS NOT NULL
+                ORDER BY order_date DESC
+                LIMIT 50
+            """)
+            orders = cur.fetchall()
+            
+            matched_order = None
+            
+            # Try to match by amount (payment should be >= order total)
+            for order in orders:
+                if order['order_total'] and payment_amount >= float(order['order_total']):
+                    # Could be this order - check name similarity if we have it
+                    if customer_name and order['customer_name']:
+                        # Simple check - first name match
+                        pay_first = customer_name.split()[0].lower()
+                        order_first = order['customer_name'].split()[0].lower()
+                        if pay_first == order_first:
+                            matched_order = order
+                            break
+                    elif not matched_order:
+                        # Take first amount match if no name match
+                        matched_order = order
+            
+            if matched_order:
+                order_total = float(matched_order['order_total']) if matched_order['order_total'] else 0
+                shipping_cost = payment_amount - order_total if order_total else None
+                
+                cur.execute("""
+                    UPDATE orders SET 
+                        payment_received = TRUE,
+                        payment_received_at = NOW(),
+                        payment_amount = %s,
+                        shipping_cost = %s,
+                        updated_at = NOW()
+                    WHERE order_id = %s
+                """, (payment_amount, shipping_cost, matched_order['order_id']))
+                
+                cur.execute("""
+                    INSERT INTO order_events (order_id, event_type, event_data, source)
+                    VALUES (%s, 'payment_received', %s, 'square_notification')
+                """, (matched_order['order_id'], json.dumps({
+                    'payment_amount': payment_amount,
+                    'shipping_cost': shipping_cost,
+                    'customer_name': customer_name
+                })))
+                
+                return {
+                    "status": "ok",
+                    "updated": True,
+                    "order_id": matched_order['order_id'],
+                    "payment_amount": payment_amount,
+                    "shipping_cost": shipping_cost
+                }
+            
+            return {
+                "status": "ok",
+                "updated": False,
+                "message": "Could not match payment to order",
+                "payment_amount": payment_amount,
+                "customer_name": customer_name
+            }
 
 # =============================================================================
 # ORDER CRUD
 # =============================================================================
 
-@app.post("/orders")
-def create_order(order: OrderCreate):
-    try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT order_id FROM orders WHERE order_id = %s", (order.order_id,))
-            if cur.fetchone():
-                raise HTTPException(status_code=409, detail=f"Order {order.order_id} already exists")
-            
-            cur.execute("""
-                INSERT INTO orders (
-                    order_id, customer_name, order_date, email_thread_id,
-                    order_total, email, phone,
-                    street, suite, city, state, zip_code,
-                    comments
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
-            """, (
-                order.order_id,
-                order.customer_name,
-                order.order_date or datetime.now(timezone.utc),
-                order.email_thread_id,
-                order.order_total,
-                order.email,
-                order.phone,
-                order.street,
-                order.suite,
-                order.city,
-                order.state,
-                order.zip_code,
-                order.comments
-            ))
-            new_order = cur.fetchone()
-            
-            cur.execute("""
-                INSERT INTO events (order_id, event_type, event_data, source)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                order.order_id,
-                "order_created",
-                json.dumps({"customer_name": order.customer_name}),
-                order.source
-            ))
-            
-            return {"status": "ok", "order": dict(new_order)}
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/orders")
 def list_orders(
-    status: Optional[str] = Query(None),
-    include_complete: bool = Query(False),
-    limit: int = Query(200)
+    status: Optional[str] = None,
+    include_complete: bool = False,
+    limit: int = 200
 ):
-    try:
-        with get_db_cursor() as cur:
-            query = "SELECT * FROM order_status_summary WHERE 1=1"
+    """List orders with optional filters"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = """
+                SELECT o.*, s.current_status, s.days_open
+                FROM orders o
+                JOIN order_status s ON o.order_id = s.order_id
+                WHERE 1=1
+            """
             params = []
             
             if not include_complete:
-                query += " AND is_complete = FALSE"
+                query += " AND NOT o.is_complete"
             
             if status:
-                query += " AND current_status = %s"
+                query += " AND s.current_status = %s"
                 params.append(status)
             
-            query += " ORDER BY order_date DESC LIMIT %s"
+            query += " ORDER BY o.order_date DESC LIMIT %s"
             params.append(limit)
             
             cur.execute(query, params)
             orders = cur.fetchall()
             
-            return {
-                "status": "ok",
-                "count": len(orders),
-                "orders": [dict(o) for o in orders]
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            # Convert decimals to floats for JSON
+            for order in orders:
+                for key in ['order_total', 'payment_amount', 'shipping_cost']:
+                    if order.get(key):
+                        order[key] = float(order[key])
+            
+            return {"status": "ok", "count": len(orders), "orders": orders}
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
-    try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT * FROM order_status_summary WHERE order_id = %s", (order_id,))
+    """Get single order details"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT o.*, s.current_status, s.days_open
+                FROM orders o
+                JOIN order_status s ON o.order_id = s.order_id
+                WHERE o.order_id = %s
+            """, (order_id,))
             order = cur.fetchone()
+            
             if not order:
-                raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
-            return {"status": "ok", "order": dict(order)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            # Convert decimals
+            for key in ['order_total', 'payment_amount', 'shipping_cost']:
+                if order.get(key):
+                    order[key] = float(order[key])
+            
+            return {"status": "ok", "order": order}
 
 @app.patch("/orders/{order_id}")
 def update_order(order_id: str, update: OrderUpdate):
-    try:
-        with get_db_cursor() as cur:
-            updates = []
-            params = []
+    """Update order fields"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Build dynamic update
+            fields = []
+            values = []
             
-            fields = [
-                ('customer_name', update.customer_name),
-                ('order_total', update.order_total),
-                ('email', update.email),
-                ('phone', update.phone),
-                ('street', update.street),
-                ('suite', update.suite),
-                ('city', update.city),
-                ('state', update.state),
-                ('zip_code', update.zip_code),
-                ('comments', update.comments),
-                ('supplier', update.supplier),
-                ('supplier_order_no', update.supplier_order_no),
-                ('tracking', update.tracking),
-                ('notes', update.notes)
-            ]
+            for field, value in update.dict(exclude_unset=True).items():
+                if value is not None:
+                    fields.append(f"{field} = %s")
+                    values.append(value)
             
-            for field_name, field_value in fields:
-                if field_value is not None:
-                    updates.append(f"{field_name} = %s")
-                    params.append(field_value)
-            
-            if not updates:
+            if not fields:
                 raise HTTPException(status_code=400, detail="No fields to update")
             
-            updates.append("updated_at = NOW()")
-            params.append(order_id)
+            fields.append("updated_at = NOW()")
+            values.append(order_id)
             
-            query = f"UPDATE orders SET {', '.join(updates)} WHERE order_id = %s RETURNING *"
-            cur.execute(query, params)
+            query = f"UPDATE orders SET {', '.join(fields)} WHERE order_id = %s"
+            cur.execute(query, values)
             
-            order = cur.fetchone()
-            if not order:
-                raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Order not found")
             
-            return {"status": "ok", "order": dict(order)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# CHECKPOINTS
-# =============================================================================
-
-VALID_CHECKPOINTS = [
-    "payment_link_sent",
-    "payment_received", 
-    "sent_to_warehouse",
-    "warehouse_confirmed",
-    "bol_sent",
-    "is_complete"
-]
+            return {"status": "ok", "message": "Order updated"}
 
 @app.patch("/orders/{order_id}/checkpoint")
 def update_checkpoint(order_id: str, update: CheckpointUpdate):
-    if update.checkpoint not in VALID_CHECKPOINTS:
-        raise HTTPException(status_code=400, detail=f"Invalid checkpoint: {update.checkpoint}")
+    """Update order checkpoint"""
+    valid_checkpoints = [
+        'payment_link_sent', 'payment_received', 'sent_to_warehouse',
+        'warehouse_confirmed', 'bol_sent', 'is_complete'
+    ]
     
-    try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT order_id FROM orders WHERE order_id = %s", (order_id,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    if update.checkpoint not in valid_checkpoints:
+        raise HTTPException(status_code=400, detail=f"Invalid checkpoint. Must be one of: {valid_checkpoints}")
+    
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            timestamp_field = f"{update.checkpoint}_at" if update.checkpoint != 'is_complete' else 'completed_at'
             
-            timestamp_col = f"{update.checkpoint}_at"
-            if update.checkpoint == "is_complete":
-                timestamp_col = "completed_at"
+            # Build update query
+            set_parts = [f"{update.checkpoint} = TRUE", f"{timestamp_field} = NOW()", "updated_at = NOW()"]
+            params = []
             
-            timestamp = update.timestamp or datetime.now(timezone.utc)
+            # Handle payment amount if provided
+            if update.checkpoint == 'payment_received' and update.payment_amount:
+                set_parts.append("payment_amount = %s")
+                params.append(update.payment_amount)
+                
+                # Calculate shipping cost
+                cur.execute("SELECT order_total FROM orders WHERE order_id = %s", (order_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    shipping = update.payment_amount - float(row[0])
+                    set_parts.append("shipping_cost = %s")
+                    params.append(shipping)
             
-            if update.value:
-                cur.execute(f"""
-                    UPDATE orders 
-                    SET {update.checkpoint} = TRUE, {timestamp_col} = %s, updated_at = NOW()
-                    WHERE order_id = %s
-                """, (timestamp, order_id))
-            else:
-                cur.execute(f"""
-                    UPDATE orders 
-                    SET {update.checkpoint} = FALSE, {timestamp_col} = NULL, updated_at = NOW()
-                    WHERE order_id = %s
-                """, (order_id,))
+            params.append(order_id)
             
-            # Update supplier if provided
-            if update.data:
-                if update.data.get("supplier"):
-                    cur.execute("UPDATE orders SET supplier = %s WHERE order_id = %s",
-                        (update.data["supplier"], order_id))
-                if update.data.get("supplier_order_no"):
-                    cur.execute("UPDATE orders SET supplier_order_no = %s WHERE order_id = %s",
-                        (update.data["supplier_order_no"], order_id))
-                if update.data.get("tracking"):
-                    cur.execute("UPDATE orders SET tracking = %s WHERE order_id = %s",
-                        (update.data["tracking"], order_id))
+            query = f"UPDATE orders SET {', '.join(set_parts)} WHERE order_id = %s"
+            cur.execute(query, params)
+            
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Order not found")
             
             # Log event
             cur.execute("""
-                INSERT INTO events (order_id, event_type, event_data, source)
+                INSERT INTO order_events (order_id, event_type, event_data, source)
                 VALUES (%s, %s, %s, %s)
             """, (
                 order_id,
-                update.checkpoint if update.value else f"{update.checkpoint}_undone",
-                json.dumps(update.data) if update.data else None,
+                update.checkpoint,
+                json.dumps({'payment_amount': update.payment_amount} if update.payment_amount else {}),
                 update.source
             ))
             
-            cur.execute("SELECT * FROM order_status_summary WHERE order_id = %s", (order_id,))
-            updated_order = cur.fetchone()
-            
-            return {"status": "ok", "order": dict(updated_order)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            return {"status": "ok", "checkpoint": update.checkpoint}
 
 # =============================================================================
-# EVENTS
+# WAREHOUSE MAPPING
 # =============================================================================
+
+@app.get("/warehouse-mapping")
+def get_warehouse_mapping():
+    """Get all warehouse mappings"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM warehouse_mapping ORDER BY sku_prefix")
+            mappings = cur.fetchall()
+            return {"status": "ok", "mappings": mappings}
+
+@app.post("/warehouse-mapping")
+def add_warehouse_mapping(mapping: WarehouseMappingUpdate):
+    """Add or update warehouse mapping"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO warehouse_mapping (sku_prefix, warehouse_name, warehouse_code)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (sku_prefix) DO UPDATE SET
+                    warehouse_name = EXCLUDED.warehouse_name,
+                    warehouse_code = EXCLUDED.warehouse_code
+            """, (mapping.sku_prefix.upper(), mapping.warehouse_name, mapping.warehouse_code))
+            
+            return {"status": "ok", "message": "Mapping saved"}
+
+# =============================================================================
+# STATUS SUMMARY
+# =============================================================================
+
+@app.get("/orders/status/summary")
+def status_summary():
+    """Get count of orders by status"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT current_status, COUNT(*) as count
+                FROM order_status
+                GROUP BY current_status
+                ORDER BY 
+                    CASE current_status
+                        WHEN 'needs_payment_link' THEN 1
+                        WHEN 'awaiting_payment' THEN 2
+                        WHEN 'needs_warehouse_order' THEN 3
+                        WHEN 'awaiting_warehouse' THEN 4
+                        WHEN 'needs_bol' THEN 5
+                        WHEN 'awaiting_shipment' THEN 6
+                        WHEN 'complete' THEN 7
+                    END
+            """)
+            summary = cur.fetchall()
+            return {"status": "ok", "summary": summary}
 
 @app.get("/orders/{order_id}/events")
 def get_order_events(order_id: str):
-    try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT order_id FROM orders WHERE order_id = %s", (order_id,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
-            
-            cur.execute("SELECT * FROM events WHERE order_id = %s ORDER BY created_at DESC", (order_id,))
+    """Get event history for an order"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM order_events 
+                WHERE order_id = %s 
+                ORDER BY created_at DESC
+            """, (order_id,))
             events = cur.fetchall()
-            
-            return {"status": "ok", "order_id": order_id, "events": [dict(e) for e in events]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# BULK IMPORT
-# =============================================================================
-
-class BulkOrderCreate(BaseModel):
-    orders: List[OrderCreate]
-
-@app.post("/orders/bulk")
-def create_orders_bulk(bulk: BulkOrderCreate):
-    created = []
-    skipped = []
-    
-    try:
-        with get_db_cursor() as cur:
-            for order in bulk.orders:
-                cur.execute("SELECT order_id FROM orders WHERE order_id = %s", (order.order_id,))
-                if cur.fetchone():
-                    skipped.append(order.order_id)
-                    continue
-                
-                cur.execute("""
-                    INSERT INTO orders (
-                        order_id, customer_name, order_date, email_thread_id,
-                        order_total, email, phone,
-                        street, suite, city, state, zip_code, comments
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    order.order_id, order.customer_name,
-                    order.order_date or datetime.now(timezone.utc),
-                    order.email_thread_id, order.order_total, order.email, order.phone,
-                    order.street, order.suite, order.city, order.state, order.zip_code,
-                    order.comments
-                ))
-                
-                cur.execute("""
-                    INSERT INTO events (order_id, event_type, source)
-                    VALUES (%s, 'order_created', 'bulk_import')
-                """, (order.order_id,))
-                
-                created.append(order.order_id)
-        
-        return {"status": "ok", "created": len(created), "skipped": len(skipped)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+            return {"status": "ok", "events": events}
