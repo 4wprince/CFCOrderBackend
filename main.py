@@ -21,7 +21,7 @@ from pydantic import BaseModel
 # CONFIG
 # =============================================================================
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 if DATABASE_URL and "sslmode" not in DATABASE_URL:
