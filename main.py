@@ -214,9 +214,11 @@ CREATE TABLE orders (
     order_total DECIMAL(10,2),
     comments TEXT,
     
-    -- Warehouses (extracted from SKU prefixes)
+    -- Warehouses (extracted from SKU prefixes, up to 4)
     warehouse_1 VARCHAR(100),
     warehouse_2 VARCHAR(100),
+    warehouse_3 VARCHAR(100),
+    warehouse_4 VARCHAR(100),
     
     -- Payment
     payment_link_sent BOOLEAN DEFAULT FALSE,
@@ -606,10 +608,12 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
             'price': price
         })
     
-    # Get warehouses for SKU prefixes
+    # Get warehouses for SKU prefixes (up to 4)
     warehouses = get_warehouses_for_skus(sku_prefixes)
     warehouse_1 = warehouses[0] if len(warehouses) > 0 else None
     warehouse_2 = warehouses[1] if len(warehouses) > 1 else None
+    warehouse_3 = warehouses[2] if len(warehouses) > 2 else None
+    warehouse_4 = warehouses[3] if len(warehouses) > 3 else None
     
     # Check if trusted customer
     is_trusted = False
@@ -630,16 +634,17 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
             cur.execute("""
                 INSERT INTO orders (
                     order_id, order_date, customer_name, company_name,
-                    street, city, state, zip_code, phone, email,
-                    comments, order_total, warehouse_1, warehouse_2,
+                    street, street2, city, state, zip_code, phone, email,
+                    comments, order_total, warehouse_1, warehouse_2, warehouse_3, warehouse_4,
                     is_trusted_customer
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (order_id) DO UPDATE SET
                     customer_name = EXCLUDED.customer_name,
                     company_name = EXCLUDED.company_name,
                     street = EXCLUDED.street,
+                    street2 = EXCLUDED.street2,
                     city = EXCLUDED.city,
                     state = EXCLUDED.state,
                     zip_code = EXCLUDED.zip_code,
@@ -649,13 +654,15 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
                     order_total = EXCLUDED.order_total,
                     warehouse_1 = COALESCE(orders.warehouse_1, EXCLUDED.warehouse_1),
                     warehouse_2 = COALESCE(orders.warehouse_2, EXCLUDED.warehouse_2),
+                    warehouse_3 = COALESCE(orders.warehouse_3, EXCLUDED.warehouse_3),
+                    warehouse_4 = COALESCE(orders.warehouse_4, EXCLUDED.warehouse_4),
                     is_trusted_customer = EXCLUDED.is_trusted_customer,
                     updated_at = NOW()
                 RETURNING order_id
             """, (
                 order_id, order_date, customer_name, company_name,
-                street, city, state, zip_code, phone, email,
-                comments, order_total, warehouse_1, warehouse_2,
+                street, street2, city, state, zip_code, phone, email,
+                comments, order_total, warehouse_1, warehouse_2, warehouse_3, warehouse_4,
                 is_trusted
             ))
             result = cur.fetchone()
@@ -675,6 +682,8 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
         'zip_code': zip_code,
         'warehouse_1': warehouse_1,
         'warehouse_2': warehouse_2,
+        'warehouse_3': warehouse_3,
+        'warehouse_4': warehouse_4,
         'line_items_count': len(line_items)
     }
 
