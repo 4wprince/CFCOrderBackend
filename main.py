@@ -62,11 +62,16 @@ def get_db():
         conn.close()
 
 SCHEMA_SQL = """
--- Orders table
+-- Drop view first (depends on orders)
+DROP VIEW IF EXISTS order_status CASCADE;
+
+-- Drop tables
 DROP TABLE IF EXISTS order_line_items CASCADE;
 DROP TABLE IF EXISTS order_events CASCADE;
+DROP TABLE IF EXISTS order_alerts CASCADE;
 DROP TABLE IF EXISTS orders CASCADE;
 DROP TABLE IF EXISTS warehouse_mapping CASCADE;
+DROP TABLE IF EXISTS trusted_customers CASCADE;
 
 CREATE TABLE warehouse_mapping (
     sku_prefix VARCHAR(20) PRIMARY KEY,
@@ -87,11 +92,8 @@ INSERT INTO warehouse_mapping (sku_prefix, warehouse_name, warehouse_code) VALUE
 ('LC', 'L&C Cabinetry', 'LC'),
 ('HSS', 'Cabinet & Stone', 'LI'),
 ('NSN', 'Cabinet & Stone', 'LI'),
-('?"', 'Cabinet & Stone', 'LI'),
 ('SHLS', 'Cabinet & Stone', 'LI'),
 ('WWW', 'LOVE', 'LOVE'),
-('DERA', 'Cabinet & Stone', 'LI'),
-('DERA', 'Cabinet & Stone', 'LI'),
 ('DERA', 'Cabinet & Stone', 'LI'),
 ('SAVNG', 'Cabinet & Stone', 'LI')
 ON CONFLICT (sku_prefix) DO NOTHING;
