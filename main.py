@@ -99,22 +99,79 @@ CREATE TABLE warehouse_mapping (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Default warehouse mappings
+-- Default warehouse mappings (from Supplier_Map)
 INSERT INTO warehouse_mapping (sku_prefix, warehouse_name, warehouse_code) VALUES
-('WSP', 'Cabinet & Stone', 'LI'),
-('GSP', 'Cabinet & Stone', 'LI'),
+-- LI
+('GSP', 'LI', 'LI'),
+('WSP', 'LI', 'LI'),
+-- DL
+('CS', 'DL', 'DL'),
+('BNG', 'DL', 'DL'),
+('UFS', 'DL', 'DL'),
+('EBK', 'DL', 'DL'),
+-- ROC
+('EGD', 'ROC', 'ROC'),
+('EMB', 'ROC', 'ROC'),
+('BC', 'ROC', 'ROC'),
+('DCH', 'ROC', 'ROC'),
+('NJGR', 'ROC', 'ROC'),
+('DCT', 'ROC', 'ROC'),
+('DCW', 'ROC', 'ROC'),
+('EJG', 'ROC', 'ROC'),
+('SNW', 'ROC', 'ROC'),
+-- Go Bravura
+('HGW', 'Go Bravura', 'GB'),
+('EMW', 'Go Bravura', 'GB'),
+('EGG', 'Go Bravura', 'GB'),
+('URC', 'Go Bravura', 'GB'),
+('WWW', 'Go Bravura', 'GB'),
+('NDG', 'Go Bravura', 'GB'),
+('NCC', 'Go Bravura', 'GB'),
+('NBW', 'Go Bravura', 'GB'),
+('URW', 'Go Bravura', 'GB'),
+('BX', 'Go Bravura', 'GB'),
+-- Love-Milestone
+('EDG', 'Love-Milestone', 'LOVE'),
+('EWD', 'Love-Milestone', 'LOVE'),
+('RND', 'Love-Milestone', 'LOVE'),
+('RMW', 'Love-Milestone', 'LOVE'),
+('NBLK', 'Love-Milestone', 'LOVE'),
+('HSS', 'Love-Milestone', 'LOVE'),
+('LGS', 'Love-Milestone', 'LOVE'),
+('LGSS', 'Love-Milestone', 'LOVE'),
+('SWO', 'Love-Milestone', 'LOVE'),
+('EWT', 'Love-Milestone', 'LOVE'),
+('DG', 'Love-Milestone', 'LOVE'),
+('EWSCS', 'Love-Milestone', 'LOVE'),
+('BGR', 'Love-Milestone', 'LOVE'),
+('BESCS', 'Love-Milestone', 'LOVE'),
+-- Cabinet & Stone
+('CAWN', 'Cabinet & Stone', 'CS'),
+('BSN', 'Cabinet & Stone', 'CS'),
+('WOCS', 'Cabinet & Stone', 'CS'),
+('ESCS', 'Cabinet & Stone', 'CS'),
+('SIV', 'Cabinet & Stone', 'CS'),
+('SAVNG', 'Cabinet & Stone', 'CS'),
+('MSCS', 'Cabinet & Stone', 'CS'),
+('SGCS', 'Cabinet & Stone', 'CS'),
+-- DuraStone
+('CMEN', 'DuraStone', 'DS'),
+('NSLS', 'DuraStone', 'DS'),
+('NBDS', 'DuraStone', 'DS'),
+('NSN', 'DuraStone', 'DS'),
+-- L&C Cabinetry
+('EDD', 'L&C Cabinetry', 'LC'),
+('RBLS', 'L&C Cabinetry', 'LC'),
+('SWNG', 'L&C Cabinetry', 'LC'),
+('MGLS', 'L&C Cabinetry', 'LC'),
+('BG', 'L&C Cabinetry', 'LC'),
+('SHLS', 'L&C Cabinetry', 'LC'),
+-- GHI
+('NOR', 'GHI', 'GHI'),
+('SNS', 'GHI', 'GHI'),
 ('AKS', 'GHI', 'GHI'),
-('DL', 'DL Cabinetry', 'DL'),
-('DS', 'Durastone', 'DS'),
-('ROC', 'ROC Cabinetry', 'ROC'),
-('GHI', 'GHI', 'GHI'),
-('LC', 'L&C Cabinetry', 'LC'),
-('HSS', 'Cabinet & Stone', 'LI'),
-('NSN', 'Cabinet & Stone', 'LI'),
-('SHLS', 'Cabinet & Stone', 'LI'),
-('WWW', 'LOVE', 'LOVE'),
-('DERA', 'Cabinet & Stone', 'LI'),
-('SAVNG', 'Cabinet & Stone', 'LI')
+('APW', 'GHI', 'GHI'),
+('GRSH', 'GHI', 'GHI')
 ON CONFLICT (sku_prefix) DO NOTHING;
 
 -- Trusted customers (can ship before payment)
@@ -147,6 +204,7 @@ CREATE TABLE orders (
     
     -- Address
     street VARCHAR(255),
+    street2 VARCHAR(255),
     city VARCHAR(100),
     state VARCHAR(50),
     zip_code VARCHAR(20),
@@ -500,10 +558,9 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
     phone = order.get('customer_phone', '')
     
     # Extract address - B2BWave provides these as separate fields!
+    # Keep them separate for shipping integrations (RL Carriers, Pirateship)
     street = order.get('address', '')
-    street2 = order.get('address2', '')
-    if street2:
-        street = f"{street}, {street2}"
+    street2 = order.get('address2', '')  # Suite/Unit - kept separate
     city = order.get('city', '')
     state = order.get('province', '')  # B2BWave calls it 'province'
     zip_code = order.get('postal_code', '')
