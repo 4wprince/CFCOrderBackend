@@ -70,7 +70,7 @@ CREATE TABLE warehouse_mapping (
 -- Default warehouse mappings
 INSERT INTO warehouse_mapping (sku_prefix, warehouse_name, warehouse_code) VALUES
 ('WSP', 'Cabinet & Stone', 'LI'),
-('GSP', 'Gobravura', 'GOB'),
+('GSP', 'Cabinet & Stone', 'LI'),
 ('AKS', 'GHI', 'GHI'),
 ('DL', 'DL Cabinetry', 'DL'),
 ('DS', 'Durastone', 'DS'),
@@ -81,8 +81,45 @@ INSERT INTO warehouse_mapping (sku_prefix, warehouse_name, warehouse_code) VALUE
 ('NSN', 'Cabinet & Stone', 'LI'),
 ('?"', 'Cabinet & Stone', 'LI'),
 ('SHLS', 'Cabinet & Stone', 'LI'),
-('WWW', 'LOVE', 'LOVE')
+('WWW', 'LOVE', 'LOVE'),
+('DERA', 'Cabinet & Stone', 'LI'),
+('DERA', 'Cabinet & Stone', 'LI'),
+('DERA', 'Cabinet & Stone', 'LI'),
+('SAVNG', 'Cabinet & Stone', 'LI')
 ON CONFLICT (sku_prefix) DO NOTHING;
+
+-- Trusted customers (can ship before payment)
+CREATE TABLE trusted_customers (
+    id SERIAL PRIMARY KEY,
+    customer_name VARCHAR(255) NOT NULL,
+    company_name VARCHAR(255),
+    email VARCHAR(255),
+    phone VARCHAR(50),
+    payment_grace_days INTEGER DEFAULT 1,
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+INSERT INTO trusted_customers (customer_name, company_name, notes) VALUES
+('Lou Palumbo', 'Louis And Clark Contracting', 'Long-time trusted customer'),
+('Gerald Thomas', 'G & B Wood Creations', 'Trusted customer'),
+('LD Stafford', 'Acute Custom Closets', 'Trusted customer'),
+('James Marchant', NULL, 'Trusted customer')
+ON CONFLICT DO NOTHING;
+
+-- Alerts/flags table
+CREATE TABLE order_alerts (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    alert_type VARCHAR(50) NOT NULL,
+    alert_message TEXT,
+    is_resolved BOOLEAN DEFAULT FALSE,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_alerts_order ON order_alerts(order_id);
+CREATE INDEX idx_alerts_unresolved ON order_alerts(is_resolved) WHERE NOT is_resolved;
 
 CREATE TABLE orders (
     order_id VARCHAR(20) PRIMARY KEY,
@@ -116,6 +153,10 @@ CREATE TABLE orders (
     payment_amount DECIMAL(10,2),
     shipping_cost DECIMAL(10,2),
     
+    -- Shipping quotes
+    rl_quote_no VARCHAR(50),
+    shipping_quote_amount DECIMAL(10,2),
+    
     -- Warehouse processing
     sent_to_warehouse BOOLEAN DEFAULT FALSE,
     sent_to_warehouse_at TIMESTAMP WITH TIME ZONE,
@@ -127,6 +168,12 @@ CREATE TABLE orders (
     bol_sent BOOLEAN DEFAULT FALSE,
     bol_sent_at TIMESTAMP WITH TIME ZONE,
     tracking VARCHAR(255),
+    pro_number VARCHAR(50),
+    
+    -- Flags
+    is_trusted_customer BOOLEAN DEFAULT FALSE,
+    needs_review BOOLEAN DEFAULT FALSE,
+    review_reason TEXT,
     
     -- Completion
     is_complete BOOLEAN DEFAULT FALSE,
@@ -449,13 +496,17 @@ def parse_email(request: ParseEmailRequest):
                 # Create new order
                 order_date = request.email_date or datetime.now(timezone.utc).isoformat()
                 
+                # Check if trusted customer
+                trusted = is_trusted_customer(conn, parsed['customer_name'] or '', parsed['company_name'] or '')
+                
                 cur.execute("""
                     INSERT INTO orders (
                         order_id, customer_name, company_name, email, phone,
                         street, city, state, zip_code,
                         order_date, order_total, comments,
-                        warehouse_1, warehouse_2, email_thread_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        warehouse_1, warehouse_2, email_thread_id,
+                        is_trusted_customer
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     parsed['order_id'],
                     parsed['customer_name'],
@@ -471,7 +522,8 @@ def parse_email(request: ParseEmailRequest):
                     parsed['comments'],
                     warehouses[0] if len(warehouses) > 0 else None,
                     warehouses[1] if len(warehouses) > 1 else None,
-                    request.email_thread_id
+                    request.email_thread_id,
+                    trusted
                 ))
                 
                 # Log event
@@ -817,3 +869,191 @@ def get_order_events(order_id: str):
             """, (order_id,))
             events = cur.fetchall()
             return {"status": "ok", "events": events}
+
+# =============================================================================
+# TRUSTED CUSTOMERS
+# =============================================================================
+
+@app.get("/trusted-customers")
+def list_trusted_customers():
+    """List all trusted customers"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM trusted_customers ORDER BY customer_name")
+            customers = cur.fetchall()
+            return {"status": "ok", "customers": customers}
+
+@app.post("/trusted-customers")
+def add_trusted_customer(customer_name: str, company_name: Optional[str] = None, notes: Optional[str] = None):
+    """Add a trusted customer"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO trusted_customers (customer_name, company_name, notes)
+                VALUES (%s, %s, %s)
+                RETURNING id
+            """, (customer_name, company_name, notes))
+            new_id = cur.fetchone()[0]
+            return {"status": "ok", "id": new_id}
+
+@app.delete("/trusted-customers/{customer_id}")
+def remove_trusted_customer(customer_id: int):
+    """Remove a trusted customer"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM trusted_customers WHERE id = %s", (customer_id,))
+            return {"status": "ok"}
+
+def is_trusted_customer(conn, customer_name: str, company_name: str = None) -> bool:
+    """Check if customer is in trusted list"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM trusted_customers 
+            WHERE LOWER(customer_name) = LOWER(%s)
+            OR (company_name IS NOT NULL AND LOWER(company_name) = LOWER(%s))
+        """, (customer_name, company_name or ''))
+        return cur.fetchone() is not None
+
+# =============================================================================
+# ALERTS
+# =============================================================================
+
+@app.get("/alerts")
+def list_alerts(include_resolved: bool = False):
+    """List order alerts"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = """
+                SELECT a.*, o.customer_name, o.company_name, o.order_total
+                FROM order_alerts a
+                JOIN orders o ON a.order_id = o.order_id
+            """
+            if not include_resolved:
+                query += " WHERE NOT a.is_resolved"
+            query += " ORDER BY a.created_at DESC"
+            
+            cur.execute(query)
+            alerts = cur.fetchall()
+            return {"status": "ok", "alerts": alerts}
+
+@app.post("/alerts")
+def create_alert(order_id: str, alert_type: str, alert_message: str):
+    """Create an alert for an order"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO order_alerts (order_id, alert_type, alert_message)
+                VALUES (%s, %s, %s)
+                RETURNING id
+            """, (order_id, alert_type, alert_message))
+            new_id = cur.fetchone()[0]
+            return {"status": "ok", "id": new_id}
+
+@app.patch("/alerts/{alert_id}/resolve")
+def resolve_alert(alert_id: int):
+    """Resolve an alert"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE order_alerts 
+                SET is_resolved = TRUE, resolved_at = NOW()
+                WHERE id = %s
+            """, (alert_id,))
+            return {"status": "ok"}
+
+# =============================================================================
+# RL QUOTE DETECTION
+# =============================================================================
+
+@app.post("/detect-rl-quote")
+def detect_rl_quote(order_id: str, email_body: str):
+    """Detect R+L quote number from email"""
+    # Pattern: "RL Quote No: 9075654" or "Quote: 9075654" or "Quote #9075654"
+    quote_match = re.search(r'(?:RL\s+)?Quote\s*(?:No|#)?[:\s]*(\d{6,10})', email_body, re.IGNORECASE)
+    
+    if quote_match:
+        quote_no = quote_match.group(1)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE orders SET rl_quote_no = %s, updated_at = NOW()
+                    WHERE order_id = %s
+                """, (quote_no, order_id))
+                
+                cur.execute("""
+                    INSERT INTO order_events (order_id, event_type, event_data, source)
+                    VALUES (%s, 'rl_quote_captured', %s, 'email_detection')
+                """, (order_id, json.dumps({'quote_no': quote_no})))
+                
+                return {"status": "ok", "quote_no": quote_no}
+    
+    return {"status": "ok", "quote_no": None, "message": "No quote number found"}
+
+@app.post("/detect-pro-number")
+def detect_pro_number(order_id: str, email_body: str):
+    """Detect R+L PRO number from email"""
+    # Pattern: "PRO 74408602-5" or "PRO# 74408602-5" or "Pro Number: 74408602-5"
+    pro_match = re.search(r'PRO\s*(?:#|Number)?[:\s]*([A-Z]{0,2}\d{8,10}(?:-\d)?)', email_body, re.IGNORECASE)
+    
+    if pro_match:
+        pro_no = pro_match.group(1).upper()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE orders SET pro_number = %s, tracking = %s, updated_at = NOW()
+                    WHERE order_id = %s
+                """, (pro_no, f"R+L PRO {pro_no}", order_id))
+                
+                cur.execute("""
+                    INSERT INTO order_events (order_id, event_type, event_data, source)
+                    VALUES (%s, 'pro_number_captured', %s, 'email_detection')
+                """, (order_id, json.dumps({'pro_number': pro_no})))
+                
+                return {"status": "ok", "pro_number": pro_no}
+    
+    return {"status": "ok", "pro_number": None, "message": "No PRO number found"}
+
+# =============================================================================
+# TRUSTED CUSTOMER ALERT CHECK
+# =============================================================================
+
+@app.post("/check-payment-alerts")
+def check_payment_alerts():
+    """
+    Check for trusted customers who shipped but haven't paid after 1 business day.
+    Should be called periodically (e.g., daily at 9 AM).
+    """
+    alerts_created = 0
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Find orders: sent to warehouse, not paid, trusted customer, > 1 day old
+            cur.execute("""
+                SELECT o.order_id, o.customer_name, o.company_name, o.order_total,
+                       o.sent_to_warehouse_at
+                FROM orders o
+                WHERE o.sent_to_warehouse = TRUE
+                AND o.payment_received = FALSE
+                AND o.is_trusted_customer = TRUE
+                AND o.sent_to_warehouse_at < NOW() - INTERVAL '1 day'
+                AND NOT EXISTS (
+                    SELECT 1 FROM order_alerts a 
+                    WHERE a.order_id = o.order_id 
+                    AND a.alert_type = 'trusted_unpaid'
+                    AND NOT a.is_resolved
+                )
+            """)
+            
+            orders = cur.fetchall()
+            
+            for order in orders:
+                cur.execute("""
+                    INSERT INTO order_alerts (order_id, alert_type, alert_message)
+                    VALUES (%s, 'trusted_unpaid', %s)
+                """, (
+                    order['order_id'],
+                    f"Trusted customer {order['customer_name']} - shipped but unpaid for 1+ day. Total: ${order['order_total']}"
+                ))
+                alerts_created += 1
+    
+    return {"status": "ok", "alerts_created": alerts_created}
