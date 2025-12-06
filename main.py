@@ -1,12 +1,15 @@
 """
-CFC Order Workflow Backend - v5
-All parsing/logic server-side. Google Sheet is just a display layer.
+CFC Order Workflow Backend - v5.2
+All parsing/logic server-side. B2BWave API integration for clean order data.
 """
 
 import os
 import re
 import json
-from datetime import datetime, timezone
+import base64
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional, List
 from contextlib import contextmanager
@@ -27,7 +30,12 @@ if DATABASE_URL.startswith("postgres://"):
 if DATABASE_URL and "sslmode" not in DATABASE_URL:
     DATABASE_URL += "?sslmode=require"
 
-app = FastAPI(title="CFC Order Workflow", version="5.0.0")
+# B2BWave API Config
+B2BWAVE_URL = os.environ.get("B2BWAVE_URL", "").strip().rstrip('/')
+B2BWAVE_USERNAME = os.environ.get("B2BWAVE_USERNAME", "").strip()
+B2BWAVE_API_KEY = os.environ.get("B2BWAVE_API_KEY", "").strip()
+
+app = FastAPI(title="CFC Order Workflow", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -297,6 +305,9 @@ def parse_b2bwave_email(body: str, subject: str) -> dict:
         'line_items': []
     }
     
+    # Clean up body - normalize whitespace
+    clean_body = body.replace('\r\n', '\n').replace('\r', '\n')
+    
     # Extract order ID from subject: "Order Legendary Home Improvements-(#5261)"
     subject_match = re.search(r'\(#(\d{4,7})\)', subject)
     if subject_match:
@@ -304,82 +315,102 @@ def parse_b2bwave_email(body: str, subject: str) -> dict:
     
     # Also try from body
     if not result['order_id']:
-        order_id_match = re.search(r'Order ID:\s*(\d{4,7})', body)
+        order_id_match = re.search(r'Order ID:\s*(\d{4,7})', clean_body)
         if order_id_match:
             result['order_id'] = order_id_match.group(1)
     
     # Extract Name
-    name_match = re.search(r'Name:\s*(.+?)(?:\n|$)', body)
+    name_match = re.search(r'Name:\s*(.+?)(?:\n|$)', clean_body)
     if name_match:
         result['customer_name'] = name_match.group(1).strip()
     
     # Extract Company
-    company_match = re.search(r'Company:\s*(.+?)(?:\n|$)', body)
+    company_match = re.search(r'Company:\s*(.+?)(?:\n|$)', clean_body)
     if company_match:
         result['company_name'] = company_match.group(1).strip()
     
     # Extract Phone (format: "Phone 352-665-0280" or "Phone: 352-665-0280")
-    phone_match = re.search(r'Phone[:\s]+(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})', body)
+    phone_match = re.search(r'Phone[:\s]+(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})', clean_body)
     if phone_match:
         result['phone'] = phone_match.group(1).replace('.', '-').replace(' ', '-')
     
     # Extract Email
-    email_match = re.search(r'Email:\s*([\w.-]+@[\w.-]+\.\w+)', body)
+    email_match = re.search(r'Email:\s*([\w.-]+@[\w.-]+\.\w+)', clean_body)
     if email_match:
         result['email'] = email_match.group(1).lower()
     
     # Extract Comments
-    comments_match = re.search(r'Comments:\s*(.+?)(?:\n|Total:|$)', body, re.DOTALL)
+    comments_match = re.search(r'Comments:\s*(.+?)(?:\n\n|\nTotal:|\nGross|$)', clean_body, re.DOTALL)
     if comments_match:
         result['comments'] = comments_match.group(1).strip()
     
     # Extract Total
-    total_match = re.search(r'Total:\s*\$?([\d,]+\.?\d*)', body)
+    total_match = re.search(r'(?:^|\n)Total:\s*\$?([\d,]+\.?\d*)', clean_body)
     if total_match:
         result['order_total'] = float(total_match.group(1).replace(',', ''))
     
-    # Extract Address - B2BWave format:
-    # Company name line
-    # Street address line (starts with number)
-    # City  State  Zip (double spaces between parts)
-    # Phone line
+    # =========================================================================
+    # IMPROVED ADDRESS PARSING
+    # B2BWave format variations:
+    # 1. "4943 SE 10th Place\nKeystone Heights  FL  32656"
+    # 2. "4943 SE 10th Place\n\nKeystone Heights  FL  32656" (blank line between)
+    # 3. Multi-space separated: "City  State  Zip"
+    # =========================================================================
     
-    lines = body.split('\n')
-    for i, line in enumerate(lines):
-        line = line.strip()
-        
-        # Look for street address (starts with number, not "Phone" line)
-        if re.match(r'^\d+\s+\w', line) and 'phone' not in line.lower():
-            result['street'] = line
+    # First, find city/state/zip pattern anywhere in email
+    # Pattern: City (words)  STATE (2 letters)  ZIP (5 digits)
+    csz_patterns = [
+        # Double-space separated: "Keystone Heights  FL  32656"
+        r'([A-Za-z][A-Za-z\s]+?)\s{2,}([A-Z]{2})\s{2,}(\d{5}(?:-\d{4})?)',
+        # Single space with comma: "Keystone Heights, FL 32656"
+        r'([A-Za-z][A-Za-z\s]+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)',
+        # Single space: "Keystone Heights FL 32656"
+        r'([A-Za-z][A-Za-z\s]+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)',
+    ]
+    
+    for pattern in csz_patterns:
+        csz_match = re.search(pattern, clean_body)
+        if csz_match:
+            city = csz_match.group(1).strip()
+            state = csz_match.group(2)
+            zip_code = csz_match.group(3)
             
-            # Next line should be city/state/zip
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                
-                # Skip if next line is Phone
-                if next_line.lower().startswith('phone'):
-                    # City/state/zip might be on same line as street - check for pattern
-                    continue
-                
-                # Parse "Keystone Heights  FL  32656" format
-                # Could have single or double spaces
-                csz_match = re.match(r'^(.+?)\s{2,}([A-Z]{2})\s{2,}(\d{5}(?:-\d{4})?)$', next_line)
-                if csz_match:
-                    result['city'] = csz_match.group(1).strip()
-                    result['state'] = csz_match.group(2)
-                    result['zip_code'] = csz_match.group(3)
-                else:
-                    # Try single space format: "City State Zip" or "City, State Zip"
-                    csz_match2 = re.match(r'^([A-Za-z\s]+?)[,\s]+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$', next_line)
-                    if csz_match2:
-                        result['city'] = csz_match2.group(1).strip().rstrip(',')
-                        result['state'] = csz_match2.group(2)
-                        result['zip_code'] = csz_match2.group(3)
+            # Validate - city should not contain certain keywords
+            if not any(kw in city.lower() for kw in ['total', 'order', 'email', 'phone', 'comment', 'name', 'company']):
+                result['city'] = city
+                result['state'] = state
+                result['zip_code'] = zip_code
+                break
+    
+    # Now find street address - look for line starting with number before the city/state/zip
+    if result['city']:
+        # Find all lines that start with a number (potential street addresses)
+        street_pattern = r'^(\d+[^\n]+?)(?:\n|$)'
+        street_matches = re.findall(street_pattern, clean_body, re.MULTILINE)
+        
+        for street in street_matches:
+            street = street.strip()
+            # Skip if it's a phone number line or contains keywords
+            if 'phone' in street.lower():
+                continue
+            if re.match(r'^\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', street):
+                continue  # This is a phone number
+            if '$' in street:
+                continue  # This is a price line
+            
+            result['street'] = street
             break
+    
+    # If we still don't have street, try alternative approach
+    if not result['street']:
+        # Look for common street patterns
+        street_match = re.search(r'(\d+\s+(?:N\.?|S\.?|E\.?|W\.?|North|South|East|West)?\s*[A-Za-z0-9\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd|Way|Court|Ct|Place|Pl|Circle|Cir|Trail)[^\n]*)', clean_body, re.IGNORECASE)
+        if street_match:
+            result['street'] = street_match.group(1).strip()
     
     # Extract SKU codes for warehouse mapping
     # Look for patterns like HSS-3VDB15, NSN-SM8, SHLS-B09
-    sku_pattern = re.findall(r'\b([A-Z]{2,5})-[A-Z0-9]+\b', body)
+    sku_pattern = re.findall(r'\b([A-Z]{2,5})-[A-Z0-9]+\b', clean_body)
     sku_prefixes = list(set(sku_pattern))
     result['sku_prefixes'] = sku_prefixes
     
@@ -404,12 +435,178 @@ def get_warehouses_for_skus(sku_prefixes: List[str]) -> List[str]:
     return warehouses
 
 # =============================================================================
+# B2BWAVE API INTEGRATION
+# =============================================================================
+
+def b2bwave_api_request(endpoint: str, params: dict = None) -> dict:
+    """Make authenticated request to B2BWave API"""
+    if not B2BWAVE_URL or not B2BWAVE_USERNAME or not B2BWAVE_API_KEY:
+        raise HTTPException(status_code=500, detail="B2BWave API not configured")
+    
+    url = f"{B2BWAVE_URL}/api/{endpoint}.json"
+    if params:
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{url}?{query}"
+    
+    # HTTP Basic Auth
+    credentials = base64.b64encode(f"{B2BWAVE_USERNAME}:{B2BWAVE_API_KEY}".encode()).decode()
+    
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Basic {credentials}")
+    req.add_header("Content-Type", "application/json")
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=e.code, detail=f"B2BWave API error: {e.reason}")
+    except urllib.error.URLError as e:
+        raise HTTPException(status_code=500, detail=f"B2BWave connection error: {str(e)}")
+
+def sync_order_from_b2bwave(order_data: dict) -> dict:
+    """
+    Sync a single order from B2BWave API response to our database.
+    Returns the order_id and status.
+    """
+    order = order_data.get('order', order_data)
+    
+    order_id = str(order.get('id'))
+    
+    # Extract customer info
+    customer_name = order.get('customer_name', '')
+    company_name = order.get('customer_company', '')
+    email = order.get('customer_email', '')
+    phone = order.get('customer_phone', '')
+    
+    # Extract address - B2BWave provides these as separate fields!
+    street = order.get('address', '')
+    street2 = order.get('address2', '')
+    if street2:
+        street = f"{street}, {street2}"
+    city = order.get('city', '')
+    state = order.get('province', '')  # B2BWave calls it 'province'
+    zip_code = order.get('postal_code', '')
+    
+    # Comments
+    comments = order.get('comments_customer', '')
+    
+    # Totals
+    order_total = float(order.get('gross_total', 0) or 0)
+    
+    # Order date
+    submitted_at = order.get('submitted_at')
+    if submitted_at:
+        try:
+            order_date = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+        except:
+            order_date = datetime.now(timezone.utc)
+    else:
+        order_date = datetime.now(timezone.utc)
+    
+    # Extract line items and SKU prefixes
+    order_products = order.get('order_products', [])
+    sku_prefixes = []
+    line_items = []
+    
+    for op in order_products:
+        product = op.get('order_product', op)
+        product_code = product.get('product_code', '')
+        product_name = product.get('product_name', '')
+        quantity = float(product.get('quantity', 0) or 0)
+        price = float(product.get('final_price', 0) or 0)
+        
+        # Extract SKU prefix
+        if '-' in product_code:
+            prefix = product_code.split('-')[0]
+            if prefix and prefix not in sku_prefixes:
+                sku_prefixes.append(prefix)
+        
+        line_items.append({
+            'sku': product_code,
+            'product_name': product_name,
+            'quantity': quantity,
+            'price': price
+        })
+    
+    # Get warehouses for SKU prefixes
+    warehouses = get_warehouses_for_skus(sku_prefixes)
+    warehouse_1 = warehouses[0] if len(warehouses) > 0 else None
+    warehouse_2 = warehouses[1] if len(warehouses) > 1 else None
+    
+    # Check if trusted customer
+    is_trusted = False
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id FROM trusted_customers 
+                WHERE LOWER(customer_name) = LOWER(%s) 
+                   OR LOWER(company_name) = LOWER(%s)
+                   OR LOWER(email) = LOWER(%s)
+            """, (customer_name, company_name, email))
+            if cur.fetchone():
+                is_trusted = True
+    
+    # Upsert order
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO orders (
+                    order_id, order_date, customer_name, company_name,
+                    street, city, state, zip_code, phone, email,
+                    comments, order_total, warehouse_1, warehouse_2,
+                    is_trusted_customer
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (order_id) DO UPDATE SET
+                    customer_name = EXCLUDED.customer_name,
+                    company_name = EXCLUDED.company_name,
+                    street = EXCLUDED.street,
+                    city = EXCLUDED.city,
+                    state = EXCLUDED.state,
+                    zip_code = EXCLUDED.zip_code,
+                    phone = EXCLUDED.phone,
+                    email = EXCLUDED.email,
+                    comments = EXCLUDED.comments,
+                    order_total = EXCLUDED.order_total,
+                    warehouse_1 = COALESCE(orders.warehouse_1, EXCLUDED.warehouse_1),
+                    warehouse_2 = COALESCE(orders.warehouse_2, EXCLUDED.warehouse_2),
+                    is_trusted_customer = EXCLUDED.is_trusted_customer,
+                    updated_at = NOW()
+                RETURNING order_id
+            """, (
+                order_id, order_date, customer_name, company_name,
+                street, city, state, zip_code, phone, email,
+                comments, order_total, warehouse_1, warehouse_2,
+                is_trusted
+            ))
+            result = cur.fetchone()
+            
+            # Log sync event
+            cur.execute("""
+                INSERT INTO order_events (order_id, event_type, event_data, source)
+                VALUES (%s, 'b2bwave_sync', %s, 'api')
+            """, (order_id, json.dumps({'sku_prefixes': sku_prefixes})))
+    
+    return {
+        'order_id': order_id,
+        'customer_name': customer_name,
+        'company_name': company_name,
+        'city': city,
+        'state': state,
+        'zip_code': zip_code,
+        'warehouse_1': warehouse_1,
+        'warehouse_2': warehouse_2,
+        'line_items_count': len(line_items)
+    }
+
+# =============================================================================
 # ROUTES
 # =============================================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "CFC Order Workflow", "version": "5.0.0"}
+    return {"status": "ok", "service": "CFC Order Workflow", "version": "5.2.0"}
 
 @app.get("/health")
 def health():
@@ -421,7 +618,98 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.0.0"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.2.0"}
+
+# =============================================================================
+# B2BWAVE SYNC ENDPOINTS
+# =============================================================================
+
+@app.get("/b2bwave/test")
+def test_b2bwave():
+    """Test B2BWave API connection"""
+    if not B2BWAVE_URL or not B2BWAVE_USERNAME or not B2BWAVE_API_KEY:
+        return {
+            "status": "error",
+            "message": "B2BWave API not configured",
+            "config": {
+                "url_set": bool(B2BWAVE_URL),
+                "username_set": bool(B2BWAVE_USERNAME),
+                "api_key_set": bool(B2BWAVE_API_KEY)
+            }
+        }
+    
+    try:
+        # Try to fetch one order to test connection
+        data = b2bwave_api_request("orders", {"submitted_at_gteq": "2024-01-01"})
+        order_count = len(data) if isinstance(data, list) else 1
+        return {
+            "status": "ok",
+            "message": f"B2BWave API connected. Found {order_count} orders.",
+            "url": B2BWAVE_URL
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.post("/b2bwave/sync")
+def sync_from_b2bwave(days_back: int = 14):
+    """
+    Sync orders from B2BWave API.
+    Default: last 14 days of orders.
+    """
+    # Calculate date range
+    since_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    
+    try:
+        data = b2bwave_api_request("orders", {"submitted_at_gteq": since_date})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"B2BWave API error: {str(e)}")
+    
+    # Handle response format
+    orders_list = data if isinstance(data, list) else [data]
+    
+    synced = []
+    errors = []
+    
+    for order_data in orders_list:
+        try:
+            result = sync_order_from_b2bwave(order_data)
+            synced.append(result)
+        except Exception as e:
+            order_id = order_data.get('order', order_data).get('id', 'unknown')
+            errors.append({"order_id": order_id, "error": str(e)})
+    
+    return {
+        "status": "ok",
+        "synced_count": len(synced),
+        "error_count": len(errors),
+        "synced_orders": synced,
+        "errors": errors if errors else None
+    }
+
+@app.get("/b2bwave/order/{order_id}")
+def get_b2bwave_order(order_id: str):
+    """Fetch a specific order from B2BWave and sync it"""
+    try:
+        data = b2bwave_api_request("orders", {"id_eq": order_id})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"B2BWave API error: {str(e)}")
+    
+    if not data:
+        raise HTTPException(status_code=404, detail="Order not found in B2BWave")
+    
+    # Handle response format
+    order_data = data[0] if isinstance(data, list) else data
+    
+    result = sync_order_from_b2bwave(order_data)
+    
+    return {
+        "status": "ok",
+        "message": f"Order {order_id} synced from B2BWave",
+        "order": result
+    }
 
 # =============================================================================
 # EMAIL PARSING ENDPOINT
