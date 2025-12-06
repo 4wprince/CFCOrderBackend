@@ -117,20 +117,6 @@ INSERT INTO trusted_customers (customer_name, company_name, notes) VALUES
 ('James Marchant', NULL, 'Trusted customer')
 ON CONFLICT DO NOTHING;
 
--- Alerts/flags table
-CREATE TABLE order_alerts (
-    id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
-    alert_type VARCHAR(50) NOT NULL,
-    alert_message TEXT,
-    is_resolved BOOLEAN DEFAULT FALSE,
-    resolved_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_alerts_order ON order_alerts(order_id);
-CREATE INDEX idx_alerts_unresolved ON order_alerts(is_resolved) WHERE NOT is_resolved;
-
 CREATE TABLE orders (
     order_id VARCHAR(20) PRIMARY KEY,
     
@@ -195,6 +181,20 @@ CREATE TABLE orders (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Alerts/flags table (after orders so foreign key works)
+CREATE TABLE order_alerts (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    alert_type VARCHAR(50) NOT NULL,
+    alert_message TEXT,
+    is_resolved BOOLEAN DEFAULT FALSE,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_alerts_order ON order_alerts(order_id);
+CREATE INDEX idx_alerts_unresolved ON order_alerts(is_resolved) WHERE NOT is_resolved;
 
 CREATE TABLE order_line_items (
     id SERIAL PRIMARY KEY,
