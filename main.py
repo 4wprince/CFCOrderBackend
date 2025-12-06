@@ -1,6 +1,7 @@
 """
-CFC Order Workflow Backend - v5.2
+CFC Order Workflow Backend - v5.3
 All parsing/logic server-side. B2BWave API integration for clean order data.
+Auto-sync every 15 minutes.
 """
 
 import os
@@ -9,6 +10,8 @@ import json
 import base64
 import urllib.request
 import urllib.error
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional, List
@@ -35,7 +38,23 @@ B2BWAVE_URL = os.environ.get("B2BWAVE_URL", "").strip().rstrip('/')
 B2BWAVE_USERNAME = os.environ.get("B2BWAVE_USERNAME", "").strip()
 B2BWAVE_API_KEY = os.environ.get("B2BWAVE_API_KEY", "").strip()
 
-app = FastAPI(title="CFC Order Workflow", version="5.2.0")
+# Auto-sync config
+AUTO_SYNC_INTERVAL_MINUTES = 15
+AUTO_SYNC_DAYS_BACK = 7
+
+app = FastAPI(title="CFC Order Workflow", version="5.3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global for tracking last sync
+last_auto_sync = None
+auto_sync_running = False
 
 app.add_middleware(
     CORSMiddleware,
@@ -603,16 +622,78 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
     }
 
 # =============================================================================
+# AUTO-SYNC SCHEDULER
+# =============================================================================
+
+def run_auto_sync():
+    """Background sync from B2BWave - runs every 15 minutes"""
+    global last_auto_sync, auto_sync_running
+    
+    while True:
+        time.sleep(AUTO_SYNC_INTERVAL_MINUTES * 60)  # Wait 15 min
+        
+        if not B2BWAVE_URL or not B2BWAVE_USERNAME or not B2BWAVE_API_KEY:
+            print("[AUTO-SYNC] B2BWave not configured, skipping")
+            continue
+        
+        try:
+            auto_sync_running = True
+            print(f"[AUTO-SYNC] Starting sync at {datetime.now()}")
+            
+            # Calculate date range
+            since_date = (datetime.now(timezone.utc) - timedelta(days=AUTO_SYNC_DAYS_BACK)).strftime("%Y-%m-%d")
+            
+            # Fetch from B2BWave
+            data = b2bwave_api_request("orders", {"submitted_at_gteq": since_date})
+            orders_list = data if isinstance(data, list) else [data]
+            
+            synced = 0
+            for order_data in orders_list:
+                try:
+                    sync_order_from_b2bwave(order_data)
+                    synced += 1
+                except Exception as e:
+                    print(f"[AUTO-SYNC] Error syncing order: {e}")
+            
+            last_auto_sync = datetime.now(timezone.utc)
+            print(f"[AUTO-SYNC] Completed: {synced} orders synced")
+            
+        except Exception as e:
+            print(f"[AUTO-SYNC] Error: {e}")
+        finally:
+            auto_sync_running = False
+
+@app.on_event("startup")
+def start_auto_sync():
+    """Start background sync thread on app startup"""
+    if B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY:
+        thread = threading.Thread(target=run_auto_sync, daemon=True)
+        thread.start()
+        print(f"[AUTO-SYNC] Started - will sync every {AUTO_SYNC_INTERVAL_MINUTES} minutes")
+    else:
+        print("[AUTO-SYNC] B2BWave not configured, auto-sync disabled")
+
+# =============================================================================
 # ROUTES
 # =============================================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "CFC Order Workflow", "version": "5.2.0"}
+    return {
+        "status": "ok", 
+        "service": "CFC Order Workflow", 
+        "version": "5.3.0",
+        "auto_sync": {
+            "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
+            "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
+            "last_sync": last_auto_sync.isoformat() if last_auto_sync else None,
+            "running": auto_sync_running
+        }
+    }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.0.0"}
+    return {"status": "ok", "version": "5.3.0"}
 
 @app.post("/init-db")
 def init_db():
@@ -620,7 +701,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.2.0"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.3.0"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
