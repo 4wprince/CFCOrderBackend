@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.5.0
+CFC Order Workflow Backend - v5.5.1
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API.
@@ -104,7 +104,7 @@ SUPPLIER_INFO = {
     }
 }
 
-app = FastAPI(title="CFC Order Workflow", version="5.5.0")
+app = FastAPI(title="CFC Order Workflow", version="5.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -975,7 +975,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.5.0",
+        "version": "5.5.1",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -986,7 +986,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.5.0"}
+    return {"status": "ok", "version": "5.5.1"}
 
 @app.post("/init-db")
 def init_db():
@@ -994,7 +994,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.5.0"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.5.1"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
@@ -1628,6 +1628,62 @@ def update_checkpoint(order_id: str, update: CheckpointUpdate):
             ))
             
             return {"status": "ok", "checkpoint": update.checkpoint}
+
+@app.patch("/orders/{order_id}/set-status")
+def set_order_status(order_id: str, status: str, source: str = "web_ui"):
+    """
+    Set order to a specific status by resetting all checkpoints and setting appropriate ones.
+    This allows moving orders backwards in the workflow.
+    """
+    # Map status to which checkpoints should be TRUE
+    status_checkpoints = {
+        'needs_payment_link': {},  # All false
+        'awaiting_payment': {'payment_link_sent': True},
+        'needs_warehouse_order': {'payment_link_sent': True, 'payment_received': True},
+        'awaiting_warehouse': {'payment_link_sent': True, 'payment_received': True, 'sent_to_warehouse': True},
+        'needs_bol': {'payment_link_sent': True, 'payment_received': True, 'sent_to_warehouse': True, 'warehouse_confirmed': True},
+        'awaiting_shipment': {'payment_link_sent': True, 'payment_received': True, 'sent_to_warehouse': True, 'warehouse_confirmed': True, 'bol_sent': True},
+        'complete': {'payment_link_sent': True, 'payment_received': True, 'sent_to_warehouse': True, 'warehouse_confirmed': True, 'bol_sent': True, 'is_complete': True}
+    }
+    
+    if status not in status_checkpoints:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+    
+    checkpoints = status_checkpoints[status]
+    
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Reset all checkpoints first, then set the ones we need
+            cur.execute("""
+                UPDATE orders SET
+                    payment_link_sent = %s,
+                    payment_received = %s,
+                    sent_to_warehouse = %s,
+                    warehouse_confirmed = %s,
+                    bol_sent = %s,
+                    is_complete = %s,
+                    updated_at = NOW()
+                WHERE order_id = %s
+            """, (
+                checkpoints.get('payment_link_sent', False),
+                checkpoints.get('payment_received', False),
+                checkpoints.get('sent_to_warehouse', False),
+                checkpoints.get('warehouse_confirmed', False),
+                checkpoints.get('bol_sent', False),
+                checkpoints.get('is_complete', False),
+                order_id
+            ))
+            
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            # Log event
+            cur.execute("""
+                INSERT INTO order_events (order_id, event_type, event_data, source)
+                VALUES (%s, 'status_change', %s, %s)
+            """, (order_id, json.dumps({'new_status': status}), source))
+            
+            return {"status": "ok", "new_status": status}
 
 # =============================================================================
 # WAREHOUSE MAPPING
