@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.5.1
+CFC Order Workflow Backend - v5.6.0
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API.
@@ -104,7 +104,7 @@ SUPPLIER_INFO = {
     }
 }
 
-app = FastAPI(title="CFC Order Workflow", version="5.5.1")
+app = FastAPI(title="CFC Order Workflow", version="5.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -373,11 +373,34 @@ CREATE TABLE order_email_snippets (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Shipments table - each warehouse in an order is a separate shipment
+CREATE TABLE order_shipments (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    shipment_id VARCHAR(50) NOT NULL UNIQUE,  -- e.g., "5307-Li"
+    warehouse VARCHAR(100) NOT NULL,
+    status VARCHAR(50) DEFAULT 'needs_order',  -- needs_order, at_warehouse, needs_bol, ready_ship, shipped, delivered
+    tracking VARCHAR(100),
+    pro_number VARCHAR(50),
+    bol_sent BOOLEAN DEFAULT FALSE,
+    bol_sent_at TIMESTAMP WITH TIME ZONE,
+    weight DECIMAL(10,2),
+    ship_method VARCHAR(50),  -- LTL, Pirateship, Pickup, BoxTruck, LiDelivery
+    sent_to_warehouse_at TIMESTAMP WITH TIME ZONE,
+    warehouse_confirmed_at TIMESTAMP WITH TIME ZONE,
+    shipped_at TIMESTAMP WITH TIME ZONE,
+    delivered_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 CREATE INDEX idx_orders_complete ON orders(is_complete);
 CREATE INDEX idx_orders_date ON orders(order_date DESC);
 CREATE INDEX idx_line_items_order ON order_line_items(order_id);
 CREATE INDEX idx_events_order ON order_events(order_id);
 CREATE INDEX idx_email_snippets_order ON order_email_snippets(order_id);
+CREATE INDEX idx_shipments_order ON order_shipments(order_id);
+CREATE INDEX idx_shipments_id ON order_shipments(shipment_id);
 
 -- View for current status
 CREATE OR REPLACE VIEW order_status AS
@@ -899,6 +922,22 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
                 INSERT INTO order_events (order_id, event_type, event_data, source)
                 VALUES (%s, 'b2bwave_sync', %s, 'api')
             """, (order_id, json.dumps({'sku_prefixes': sku_prefixes})))
+            
+            # Auto-create shipments for each warehouse
+            warehouses_list = [w for w in [warehouse_1, warehouse_2, warehouse_3, warehouse_4] if w]
+            for wh in warehouses_list:
+                # Create shipment_id like "5307-Li"
+                # Clean warehouse name for ID (remove spaces, special chars)
+                wh_short = wh.replace(' & ', '-').replace(' ', '-')
+                shipment_id = f"{order_id}-{wh_short}"
+                
+                # Check if shipment already exists
+                cur.execute("SELECT id FROM order_shipments WHERE shipment_id = %s", (shipment_id,))
+                if not cur.fetchone():
+                    cur.execute("""
+                        INSERT INTO order_shipments (order_id, shipment_id, warehouse, status)
+                        VALUES (%s, %s, %s, 'needs_order')
+                    """, (order_id, shipment_id, wh))
     
     return {
         'order_id': order_id,
@@ -975,7 +1014,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.5.1",
+        "version": "5.6.0",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -986,7 +1025,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.5.1"}
+    return {"status": "ok", "version": "5.6.0"}
 
 @app.post("/init-db")
 def init_db():
@@ -994,7 +1033,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.5.1"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.6.0"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
@@ -1330,7 +1369,7 @@ def list_orders(
     include_complete: bool = False,
     limit: int = 200
 ):
-    """List orders with optional filters"""
+    """List orders with optional filters, including shipments"""
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             query = """
@@ -1354,11 +1393,30 @@ def list_orders(
             cur.execute(query, params)
             orders = cur.fetchall()
             
-            # Convert decimals to floats for JSON
+            # Get shipments for all orders
+            order_ids = [o['order_id'] for o in orders]
+            shipments_by_order = {}
+            if order_ids:
+                cur.execute("""
+                    SELECT * FROM order_shipments 
+                    WHERE order_id = ANY(%s)
+                    ORDER BY warehouse
+                """, (order_ids,))
+                for ship in cur.fetchall():
+                    oid = ship['order_id']
+                    if oid not in shipments_by_order:
+                        shipments_by_order[oid] = []
+                    # Convert decimals
+                    if ship.get('weight'):
+                        ship['weight'] = float(ship['weight'])
+                    shipments_by_order[oid].append(dict(ship))
+            
+            # Convert decimals to floats for JSON and attach shipments
             for order in orders:
                 for key in ['order_total', 'payment_amount', 'shipping_cost']:
                     if order.get(key):
                         order[key] = float(order[key])
+                order['shipments'] = shipments_by_order.get(order['order_id'], [])
             
             return {"status": "ok", "count": len(orders), "orders": orders}
 
@@ -1684,6 +1742,142 @@ def set_order_status(order_id: str, status: str, source: str = "web_ui"):
             """, (order_id, json.dumps({'new_status': status}), source))
             
             return {"status": "ok", "new_status": status}
+
+# =============================================================================
+# SHIPMENT MANAGEMENT
+# =============================================================================
+
+@app.get("/orders/{order_id}/shipments")
+def get_order_shipments(order_id: str):
+    """Get all shipments for an order"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM order_shipments 
+                WHERE order_id = %s 
+                ORDER BY warehouse
+            """, (order_id,))
+            shipments = cur.fetchall()
+            return {"status": "ok", "shipments": shipments}
+
+@app.get("/shipments")
+def list_all_shipments(include_complete: bool = False):
+    """List all shipments with order info"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = """
+                SELECT s.*, o.customer_name, o.company_name, o.order_date,
+                       o.street, o.street2, o.city, o.state, o.zip_code, o.phone,
+                       o.payment_received, o.order_total
+                FROM order_shipments s
+                JOIN orders o ON s.order_id = o.order_id
+                WHERE 1=1
+            """
+            if not include_complete:
+                query += " AND s.status != 'delivered'"
+            query += " ORDER BY o.order_date DESC, s.warehouse"
+            
+            cur.execute(query)
+            shipments = cur.fetchall()
+            
+            # Convert decimals
+            for s in shipments:
+                if s.get('order_total'):
+                    s['order_total'] = float(s['order_total'])
+                if s.get('weight'):
+                    s['weight'] = float(s['weight'])
+            
+            return {"status": "ok", "count": len(shipments), "shipments": shipments}
+
+@app.patch("/shipments/{shipment_id}")
+def update_shipment(shipment_id: str, 
+                    status: Optional[str] = None,
+                    tracking: Optional[str] = None,
+                    pro_number: Optional[str] = None,
+                    weight: Optional[float] = None,
+                    ship_method: Optional[str] = None,
+                    bol_sent: Optional[bool] = None):
+    """Update shipment fields"""
+    
+    valid_statuses = ['needs_order', 'at_warehouse', 'needs_bol', 'ready_ship', 'shipped', 'delivered']
+    if status and status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")
+    
+    valid_methods = ['LTL', 'Pirateship', 'Pickup', 'BoxTruck', 'LiDelivery', None]
+    if ship_method and ship_method not in valid_methods:
+        raise HTTPException(status_code=400, detail=f"Invalid ship_method. Must be one of: {valid_methods}")
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Build dynamic update
+            updates = []
+            params = []
+            
+            if status is not None:
+                updates.append("status = %s")
+                params.append(status)
+                # Set timestamp based on status
+                if status == 'at_warehouse':
+                    updates.append("sent_to_warehouse_at = NOW()")
+                elif status == 'needs_bol':
+                    updates.append("warehouse_confirmed_at = NOW()")
+                elif status == 'shipped':
+                    updates.append("shipped_at = NOW()")
+                elif status == 'delivered':
+                    updates.append("delivered_at = NOW()")
+            
+            if tracking is not None:
+                updates.append("tracking = %s")
+                params.append(tracking)
+            
+            if pro_number is not None:
+                updates.append("pro_number = %s")
+                params.append(pro_number)
+            
+            if weight is not None:
+                updates.append("weight = %s")
+                params.append(weight)
+            
+            if ship_method is not None:
+                updates.append("ship_method = %s")
+                params.append(ship_method)
+            
+            if bol_sent is not None:
+                updates.append("bol_sent = %s")
+                params.append(bol_sent)
+                if bol_sent:
+                    updates.append("bol_sent_at = NOW()")
+            
+            if not updates:
+                return {"status": "ok", "message": "No updates provided"}
+            
+            updates.append("updated_at = NOW()")
+            params.append(shipment_id)
+            
+            query = f"UPDATE order_shipments SET {', '.join(updates)} WHERE shipment_id = %s RETURNING *"
+            cur.execute(query, params)
+            
+            result = cur.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="Shipment not found")
+            
+            # Check if all shipments for this order are delivered
+            cur.execute("""
+                SELECT COUNT(*) as total, 
+                       COUNT(*) FILTER (WHERE status = 'delivered') as delivered
+                FROM order_shipments 
+                WHERE order_id = %s
+            """, (result['order_id'],))
+            counts = cur.fetchone()
+            
+            # If all delivered, mark order complete
+            if counts['total'] > 0 and counts['total'] == counts['delivered']:
+                cur.execute("""
+                    UPDATE orders SET is_complete = TRUE, completed_at = NOW(), updated_at = NOW()
+                    WHERE order_id = %s
+                """, (result['order_id'],))
+            
+            return {"status": "ok", "shipment": dict(result)}
 
 # =============================================================================
 # WAREHOUSE MAPPING
