@@ -1014,7 +1014,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.6.0",
+        "version": "5.6.1",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1025,7 +1025,37 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.6.0"}
+    return {"status": "ok", "version": "5.6.1"}
+
+@app.post("/create-shipments-table")
+def create_shipments_table():
+    """Create order_shipments table without resetting other tables"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS order_shipments (
+                    id SERIAL PRIMARY KEY,
+                    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+                    shipment_id VARCHAR(50) NOT NULL UNIQUE,
+                    warehouse VARCHAR(100) NOT NULL,
+                    status VARCHAR(50) DEFAULT 'needs_order',
+                    tracking VARCHAR(100),
+                    pro_number VARCHAR(50),
+                    bol_sent BOOLEAN DEFAULT FALSE,
+                    bol_sent_at TIMESTAMP WITH TIME ZONE,
+                    weight DECIMAL(10,2),
+                    ship_method VARCHAR(50),
+                    sent_to_warehouse_at TIMESTAMP WITH TIME ZONE,
+                    warehouse_confirmed_at TIMESTAMP WITH TIME ZONE,
+                    shipped_at TIMESTAMP WITH TIME ZONE,
+                    delivered_at TIMESTAMP WITH TIME ZONE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_order ON order_shipments(order_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_id ON order_shipments(shipment_id)")
+    return {"status": "ok", "message": "order_shipments table created"}
 
 @app.post("/init-db")
 def init_db():
@@ -1033,7 +1063,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.6.0"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.6.1"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
