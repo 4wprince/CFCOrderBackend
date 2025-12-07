@@ -1,7 +1,8 @@
 """
-CFC Order Workflow Backend - v5.4.1
+CFC Order Workflow Backend - v5.5.0
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
+AI Summary with Anthropic Claude API.
 """
 
 import os
@@ -37,6 +38,9 @@ if DATABASE_URL and "sslmode" not in DATABASE_URL:
 B2BWAVE_URL = os.environ.get("B2BWAVE_URL", "").strip().rstrip('/')
 B2BWAVE_USERNAME = os.environ.get("B2BWAVE_USERNAME", "").strip()
 B2BWAVE_API_KEY = os.environ.get("B2BWAVE_API_KEY", "").strip()
+
+# Anthropic API Config
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
 # Auto-sync config
 AUTO_SYNC_INTERVAL_MINUTES = 15
@@ -100,7 +104,7 @@ SUPPLIER_INFO = {
     }
 }
 
-app = FastAPI(title="CFC Order Workflow", version="5.4.1")
+app = FastAPI(title="CFC Order Workflow", version="5.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -315,6 +319,8 @@ CREATE TABLE orders (
     -- Meta
     email_thread_id VARCHAR(255),
     notes TEXT,
+    ai_summary TEXT,
+    ai_summary_updated_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -354,10 +360,24 @@ CREATE TABLE order_events (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Email snippets for AI summary
+CREATE TABLE order_email_snippets (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    email_from VARCHAR(255),
+    email_to VARCHAR(255),
+    email_subject VARCHAR(500),
+    email_snippet TEXT,
+    email_date TIMESTAMP WITH TIME ZONE,
+    snippet_type VARCHAR(50),  -- 'customer', 'supplier', 'internal', 'payment'
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 CREATE INDEX idx_orders_complete ON orders(is_complete);
 CREATE INDEX idx_orders_date ON orders(order_date DESC);
 CREATE INDEX idx_line_items_order ON order_line_items(order_id);
 CREATE INDEX idx_events_order ON order_events(order_id);
+CREATE INDEX idx_email_snippets_order ON order_email_snippets(order_id);
 
 -- View for current status
 CREATE OR REPLACE VIEW order_status AS
@@ -572,6 +592,135 @@ def get_warehouses_for_skus(sku_prefixes: List[str]) -> List[str]:
             warehouses = [row['warehouse_name'] for row in cur.fetchall()]
     
     return warehouses
+
+# =============================================================================
+# AI SUMMARY (ANTHROPIC CLAUDE API)
+# =============================================================================
+
+def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
+    """Call Anthropic Claude API to generate summary"""
+    if not ANTHROPIC_API_KEY:
+        return "AI Summary not available - API key not configured"
+    
+    url = "https://api.anthropic.com/v1/messages"
+    
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+    
+    data = json.dumps(payload).encode('utf-8')
+    
+    req = urllib.request.Request(url, data=data, method='POST')
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-api-key", ANTHROPIC_API_KEY)
+    req.add_header("anthropic-version", "2023-06-01")
+    
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode())
+            if result.get('content') and len(result['content']) > 0:
+                return result['content'][0].get('text', '')
+            return "No summary generated"
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else str(e)
+        print(f"Anthropic API Error: {e.code} - {error_body}")
+        return f"AI Summary error: {e.code}"
+    except Exception as e:
+        print(f"Anthropic API Exception: {e}")
+        return f"AI Summary error: {str(e)}"
+
+def generate_order_summary(order_id: str) -> str:
+    """Generate AI summary for an order based on all available data"""
+    
+    # Gather all order data
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get order details
+            cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+            order = cur.fetchone()
+            
+            if not order:
+                return "Order not found"
+            
+            # Get email snippets
+            cur.execute("""
+                SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
+                FROM order_email_snippets 
+                WHERE order_id = %s 
+                ORDER BY email_date DESC
+                LIMIT 20
+            """, (order_id,))
+            snippets = cur.fetchall()
+            
+            # Get events
+            cur.execute("""
+                SELECT event_type, event_data, created_at 
+                FROM order_events 
+                WHERE order_id = %s 
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (order_id,))
+            events = cur.fetchall()
+    
+    # Build context for AI
+    context_parts = []
+    
+    # Order info
+    context_parts.append(f"ORDER #{order_id}")
+    context_parts.append(f"Customer: {order.get('company_name') or order.get('customer_name')}")
+    context_parts.append(f"Order Total: ${order.get('order_total', 0)}")
+    context_parts.append(f"Payment Received: {'Yes' if order.get('payment_received') else 'No'}")
+    if order.get('tracking'):
+        context_parts.append(f"Tracking: {order.get('tracking')}")
+    if order.get('pro_number'):
+        context_parts.append(f"PRO Number: {order.get('pro_number')}")
+    if order.get('comments'):
+        context_parts.append(f"Customer Comments: {order.get('comments')}")
+    if order.get('notes'):
+        context_parts.append(f"Internal Notes: {order.get('notes')}")
+    
+    # Warehouses
+    warehouses = [order.get(f'warehouse_{i}') for i in range(1, 5) if order.get(f'warehouse_{i}')]
+    if warehouses:
+        context_parts.append(f"Warehouses: {', '.join(warehouses)}")
+    
+    # Email snippets
+    if snippets:
+        context_parts.append("\nEMAIL COMMUNICATIONS:")
+        for s in snippets:
+            date_str = s['email_date'].strftime('%m/%d') if s.get('email_date') else ''
+            context_parts.append(f"- [{date_str}] From: {s.get('email_from', 'Unknown')}")
+            context_parts.append(f"  Subject: {s.get('email_subject', '')}")
+            if s.get('email_snippet'):
+                context_parts.append(f"  {s['email_snippet'][:300]}")
+    
+    # Events
+    if events:
+        context_parts.append("\nORDER EVENTS:")
+        for e in events:
+            date_str = e['created_at'].strftime('%m/%d %H:%M') if e.get('created_at') else ''
+            context_parts.append(f"- [{date_str}] {e.get('event_type')}")
+    
+    context = "\n".join(context_parts)
+    
+    # Create prompt
+    prompt = f"""Summarize this order's status and any important information in bullet points. 
+Focus on:
+- Current status and what needs to happen next
+- Any issues, questions, or special requests
+- Payment status
+- Shipping/tracking info if available
+- Any notable communications
+
+Keep it concise - max 5-7 bullet points.
+
+{context}"""
+    
+    return call_anthropic_api(prompt)
 
 # =============================================================================
 # B2BWAVE API INTEGRATION
@@ -826,7 +975,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.4.1",
+        "version": "5.5.0",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -837,7 +986,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.4.1"}
+    return {"status": "ok", "version": "5.5.0"}
 
 @app.post("/init-db")
 def init_db():
@@ -845,7 +994,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.4.1"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.5.0"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
@@ -1235,6 +1384,86 @@ def get_order(order_id: str):
                     order[key] = float(order[key])
             
             return {"status": "ok", "order": order}
+
+@app.post("/orders/{order_id}/generate-summary")
+def generate_summary_endpoint(order_id: str, force: bool = False):
+    """
+    Generate AI summary for an order.
+    If force=False and summary exists and is less than 1 hour old, returns cached.
+    """
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Check for existing recent summary
+            cur.execute("""
+                SELECT ai_summary, ai_summary_updated_at 
+                FROM orders 
+                WHERE order_id = %s
+            """, (order_id,))
+            order = cur.fetchone()
+            
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            # Return cached if recent and not forcing refresh
+            if not force and order.get('ai_summary') and order.get('ai_summary_updated_at'):
+                age = datetime.now(timezone.utc) - order['ai_summary_updated_at']
+                if age < timedelta(hours=1):
+                    return {
+                        "status": "ok", 
+                        "summary": order['ai_summary'],
+                        "cached": True,
+                        "updated_at": order['ai_summary_updated_at'].isoformat()
+                    }
+    
+    # Generate new summary
+    summary = generate_order_summary(order_id)
+    
+    # Save to database
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE orders 
+                SET ai_summary = %s, ai_summary_updated_at = NOW(), updated_at = NOW()
+                WHERE order_id = %s
+            """, (summary, order_id))
+    
+    return {
+        "status": "ok",
+        "summary": summary,
+        "cached": False,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.post("/orders/{order_id}/add-email-snippet")
+def add_email_snippet(
+    order_id: str,
+    email_from: str,
+    email_subject: str,
+    email_snippet: str,
+    email_date: Optional[str] = None,
+    snippet_type: str = "general"
+):
+    """Add an email snippet for an order (called by Google Script)"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Parse date
+            parsed_date = None
+            if email_date:
+                try:
+                    parsed_date = datetime.fromisoformat(email_date.replace('Z', '+00:00'))
+                except:
+                    parsed_date = datetime.now(timezone.utc)
+            else:
+                parsed_date = datetime.now(timezone.utc)
+            
+            cur.execute("""
+                INSERT INTO order_email_snippets 
+                (order_id, email_from, email_subject, email_snippet, email_date, snippet_type)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (order_id, email_from, email_subject, email_snippet[:1000], parsed_date, snippet_type))
+    
+    return {"status": "ok", "message": "Email snippet added"}
 
 @app.get("/orders/{order_id}/supplier-sheet-data")
 def get_supplier_sheet_data(order_id: str):
