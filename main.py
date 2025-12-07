@@ -42,7 +42,65 @@ B2BWAVE_API_KEY = os.environ.get("B2BWAVE_API_KEY", "").strip()
 AUTO_SYNC_INTERVAL_MINUTES = 15
 AUTO_SYNC_DAYS_BACK = 7
 
-app = FastAPI(title="CFC Order Workflow", version="5.3.0")
+# Supplier contact info
+SUPPLIER_INFO = {
+    'LI': {
+        'name': 'Li',
+        'address': '561 Keuka Rd, Interlachen FL 32148',
+        'contact': 'Li Yang (615) 410-6775',
+        'email': 'cabinetrydistribution@gmail.com'
+    },
+    'DL': {
+        'name': 'DL Cabinetry',
+        'address': '8145 Baymeadows Way W, Jacksonville FL 32256',
+        'contact': 'Lily Chen (904) 723-1061',
+        'email': 'ecomm@dlcabinetry.com'
+    },
+    'ROC': {
+        'name': 'ROC Cabinetry',
+        'address': '505 Best Friend Court Suite 580, Norcross GA 30071',
+        'contact': 'Franklin Velasquez (770) 847-8222',
+        'email': 'weborders01@roccabinetry.com'
+    },
+    'Go Bravura': {
+        'name': 'Go Bravura',
+        'address': '14200 Hollister Street Suite 200, Houston TX 77066',
+        'contact': 'Vincent Pan (832) 756-2768',
+        'email': 'vpan@gobravura.com'
+    },
+    'Love-Milestone': {
+        'name': 'Love-Milestone',
+        'address': '10963 Florida Crown Dr STE 100, Orlando FL 32824',
+        'contact': 'Ireen',
+        'email': 'lovetoucheskitchen@gmail.com'
+    },
+    'Cabinet & Stone': {
+        'name': 'Cabinet & Stone',
+        'address': '1760 Stebbins Dr, Houston TX 77043',
+        'contact': 'Amy Cao (281) 833-0980',
+        'email': 'amy@cabinetstonellc.com'
+    },
+    'DuraStone': {
+        'name': 'DuraStone',
+        'address': '9815 North Fwy, Houston TX 77037',
+        'contact': 'Ranjith Venugopalan / Rachel Guo (832) 228-7866',
+        'email': 'ranji@durastoneusa.com'
+    },
+    'L&C Cabinetry': {
+        'name': 'L&C Cabinetry',
+        'address': '2028 Virginia Beach Blvd, Virginia Beach VA 23454',
+        'contact': 'Rey Allison (757) 917-5619',
+        'email': 'lnccabinetryvab@gmail.com'
+    },
+    'GHI': {
+        'name': 'GHI',
+        'address': '1807 48th Ave E Unit 110, Palmetto FL 34221',
+        'contact': 'Kathryn Belfiore (941) 479-8070',
+        'email': 'kbelfiore@ghicabinets.com'
+    }
+}
+
+app = FastAPI(title="CFC Order Workflow", version="5.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -748,7 +806,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.3.0",
+        "version": "5.4.0",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -759,7 +817,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.3.0"}
+    return {"status": "ok", "version": "5.4.0"}
 
 @app.post("/init-db")
 def init_db():
@@ -767,7 +825,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.3.0"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.4.0"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
@@ -1157,6 +1215,89 @@ def get_order(order_id: str):
                     order[key] = float(order[key])
             
             return {"status": "ok", "order": order}
+
+@app.get("/orders/{order_id}/supplier-sheet-data")
+def get_supplier_sheet_data(order_id: str):
+    """
+    Get order data organized by warehouse for supplier sheet generation.
+    Returns data formatted for creating Google Sheet with tabs per supplier.
+    """
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get order details
+            cur.execute("""
+                SELECT * FROM orders WHERE order_id = %s
+            """, (order_id,))
+            order = cur.fetchone()
+            
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            # Get line items
+            cur.execute("""
+                SELECT * FROM order_line_items WHERE order_id = %s
+            """, (order_id,))
+            line_items = cur.fetchall()
+    
+    # Build customer info
+    customer_name = order.get('customer_name') or ''
+    company_name = order.get('company_name') or ''
+    customer_display = company_name if company_name else customer_name
+    if company_name and customer_name:
+        customer_display = f"{company_name} ({customer_name})"
+    
+    street = order.get('street') or ''
+    street2 = order.get('street2') or ''
+    city = order.get('city') or ''
+    state = order.get('state') or ''
+    zip_code = order.get('zip_code') or ''
+    phone = order.get('phone') or ''
+    email = order.get('email') or ''
+    
+    address_parts = [street]
+    if street2:
+        address_parts.append(street2)
+    address_parts.append(f"{city}, {state} {zip_code}")
+    customer_address = ', '.join(filter(None, address_parts))
+    
+    comments = order.get('comments') or ''
+    
+    # Group items by warehouse
+    warehouses = {}
+    for item in line_items:
+        wh = item.get('warehouse') or 'Unknown'
+        if wh not in warehouses:
+            # Get supplier info
+            supplier_info = SUPPLIER_INFO.get(wh, {
+                'name': wh,
+                'address': '',
+                'contact': '',
+                'email': ''
+            })
+            warehouses[wh] = {
+                'supplier_name': supplier_info['name'],
+                'supplier_address': supplier_info['address'],
+                'supplier_contact': supplier_info['contact'],
+                'supplier_email': supplier_info['email'],
+                'items': []
+            }
+        
+        warehouses[wh]['items'].append({
+            'quantity': item.get('quantity') or 1,
+            'product_code': item.get('sku') or '',
+            'product_name': item.get('product_name') or ''
+        })
+    
+    return {
+        "status": "ok",
+        "order_id": order_id,
+        "customer_name": customer_display,
+        "customer_address": customer_address,
+        "customer_phone": phone,
+        "customer_email": email,
+        "comments": comments,
+        "warehouses": warehouses
+    }
 
 @app.patch("/orders/{order_id}")
 def update_order(order_id: str, update: OrderUpdate):
