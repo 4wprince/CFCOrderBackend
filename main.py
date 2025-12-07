@@ -100,7 +100,7 @@ SUPPLIER_INFO = {
     }
 }
 
-app = FastAPI(title="CFC Order Workflow", version="5.4.0")
+app = FastAPI(title="CFC Order Workflow", version="5.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -725,6 +725,26 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
             ))
             result = cur.fetchone()
             
+            # Delete existing line items and re-insert
+            cur.execute("DELETE FROM order_line_items WHERE order_id = %s", (order_id,))
+            
+            # Insert line items with warehouse info
+            for item in line_items:
+                sku = item.get('sku', '')
+                prefix = sku.split('-')[0] if '-' in sku else ''
+                # Look up warehouse for this item
+                item_warehouse = None
+                if prefix:
+                    cur.execute("SELECT warehouse_name FROM warehouse_mapping WHERE sku_prefix = %s", (prefix,))
+                    wh_row = cur.fetchone()
+                    if wh_row:
+                        item_warehouse = wh_row['warehouse_name']
+                
+                cur.execute("""
+                    INSERT INTO order_line_items (order_id, sku, sku_prefix, product_name, quantity, price, warehouse)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (order_id, sku, prefix, item.get('product_name'), item.get('quantity'), item.get('price'), item_warehouse))
+            
             # Log sync event
             cur.execute("""
                 INSERT INTO order_events (order_id, event_type, event_data, source)
@@ -806,7 +826,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.4.0",
+        "version": "5.4.1",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -817,7 +837,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.4.0"}
+    return {"status": "ok", "version": "5.4.1"}
 
 @app.post("/init-db")
 def init_db():
@@ -825,7 +845,7 @@ def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-    return {"status": "ok", "message": "Database schema initialized", "version": "5.4.0"}
+    return {"status": "ok", "message": "Database schema initialized", "version": "5.4.1"}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
