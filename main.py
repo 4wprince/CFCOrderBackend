@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.2
+CFC Order Workflow Backend - v5.7.3
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.2")
+app = FastAPI(title="CFC Order Workflow", version="5.7.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.2",
+        "version": "5.7.3",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.2"}
+    return {"status": "ok", "version": "5.7.3"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -2084,6 +2084,33 @@ def get_rl_quote_data(shipment_id: str):
                 wh_count = cur.fetchone()
                 is_single_warehouse = wh_count and wh_count['warehouse_count'] <= 1
                 
+                # Get order total weight if available
+                cur.execute("SELECT order_total FROM orders WHERE order_id = %s", (shipment['order_id'],))
+                order_row = cur.fetchone()
+                
+                # Clean ZIP code - strip to 5 digits
+                dest_zip = shipment.get('zip_code') or ''
+                if '-' in dest_zip:
+                    dest_zip = dest_zip.split('-')[0]
+                dest_zip = dest_zip[:5]  # Take first 5 chars
+                
+                # Determine weight display
+                shipment_weight = float(shipment['weight']) if shipment.get('weight') else None
+                needs_manual = False
+                weight_note = None
+                
+                if shipment_weight:
+                    weight_note = "from shipment"
+                elif is_single_warehouse and total_weight > 0:
+                    shipment_weight = round(total_weight, 1)
+                    weight_note = "calculated from items"
+                elif not is_single_warehouse:
+                    needs_manual = True
+                    weight_note = "Multi-warehouse - enter weight for this shipment"
+                else:
+                    needs_manual = True
+                    weight_note = "No weight data available"
+                
                 return {
                     "status": "ok",
                     "shipment_id": shipment_id,
@@ -2095,13 +2122,12 @@ def get_rl_quote_data(shipment_id: str):
                         "street": shipment.get('street') or '',
                         "city": shipment.get('city') or '',
                         "state": shipment.get('state') or '',
-                        "zip": shipment.get('zip_code') or ''
+                        "zip": dest_zip
                     },
                     "weight": {
-                        "calculated": round(total_weight, 1) if total_weight > 0 else None,
-                        "shipment_weight": float(shipment['weight']) if shipment.get('weight') else None,
-                        "is_single_warehouse": is_single_warehouse,
-                        "needs_manual_entry": not is_single_warehouse and not shipment.get('weight')
+                        "value": shipment_weight,
+                        "note": weight_note,
+                        "needs_manual_entry": needs_manual
                     },
                     "oversized": {
                         "detected": has_oversized,
