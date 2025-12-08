@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.8
+CFC Order Workflow Backend - v5.7.9
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.8")
+app = FastAPI(title="CFC Order Workflow", version="5.7.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.8",
+        "version": "5.7.9",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.8"}
+    return {"status": "ok", "version": "5.7.9"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1164,8 +1164,12 @@ def recreate_order_status_view():
     """Recreate the order_status view after it was dropped"""
     with get_db() as conn:
         with conn.cursor() as cur:
+            # First drop the old view
+            cur.execute("DROP VIEW IF EXISTS order_status CASCADE")
+            
+            # Create new view
             cur.execute("""
-                CREATE OR REPLACE VIEW order_status AS
+                CREATE VIEW order_status AS
                 SELECT 
                     order_id,
                     CASE
@@ -1189,6 +1193,32 @@ def recreate_order_status_view():
             """)
             conn.commit()
     return {"status": "ok", "message": "order_status view recreated"}
+
+@app.get("/debug/orders-columns")
+def debug_orders_columns():
+    """Check what columns exist in orders table"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = 'orders'
+                ORDER BY ordinal_position
+            """)
+            columns = cur.fetchall()
+            
+            # Check if view exists
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'order_status'
+            """)
+            view_columns = cur.fetchall()
+            
+            return {
+                "orders_columns": [c[0] for c in columns],
+                "view_columns": [c[0] for c in view_columns] if view_columns else "view does not exist"
+            }
 
 @app.post("/init-db")
 def init_db():
