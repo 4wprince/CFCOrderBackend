@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.8.2
+CFC Order Workflow Backend - v5.8.3
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.8.2")
+app = FastAPI(title="CFC Order Workflow", version="5.8.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1040,7 +1040,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.8.2",
+        "version": "5.8.3",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1051,7 +1051,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.8.2"}
+    return {"status": "ok", "version": "5.8.3"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1088,14 +1088,18 @@ def add_rl_shipping_fields():
     """Add RL Carriers shipping fields to order_shipments table"""
     with get_db() as conn:
         with conn.cursor() as cur:
-            # Add RL quote fields
+            # Add RL quote fields and Li pricing fields
             fields_to_add = [
                 ("origin_zip", "VARCHAR(10)"),
                 ("rl_quote_number", "VARCHAR(50)"),
                 ("rl_quote_price", "DECIMAL(10,2)"),
                 ("rl_customer_price", "DECIMAL(10,2)"),
                 ("rl_invoice_amount", "DECIMAL(10,2)"),
-                ("has_oversized", "BOOLEAN DEFAULT FALSE")
+                ("has_oversized", "BOOLEAN DEFAULT FALSE"),
+                ("li_quote_price", "DECIMAL(10,2)"),
+                ("li_customer_price", "DECIMAL(10,2)"),
+                ("actual_cost", "DECIMAL(10,2)"),
+                ("quote_url", "TEXT")
             ]
             
             for field_name, field_type in fields_to_add:
@@ -1107,7 +1111,7 @@ def add_rl_shipping_fields():
                     pass
             
             conn.commit()
-    return {"status": "ok", "message": "RL shipping fields added to order_shipments"}
+    return {"status": "ok", "message": "Shipping fields added to order_shipments"}
 
 @app.post("/fix-order-id-length")
 def fix_order_id_length():
@@ -2012,7 +2016,12 @@ def update_shipment(shipment_id: str,
                     rl_quote_price: Optional[float] = None,
                     rl_customer_price: Optional[float] = None,
                     rl_invoice_amount: Optional[float] = None,
-                    has_oversized: Optional[bool] = None):
+                    has_oversized: Optional[bool] = None,
+                    li_quote_price: Optional[float] = None,
+                    li_customer_price: Optional[float] = None,
+                    actual_cost: Optional[float] = None,
+                    quote_url: Optional[str] = None,
+                    tracking_number: Optional[str] = None):
     """Update shipment fields"""
     
     valid_statuses = ['needs_order', 'at_warehouse', 'needs_bol', 'ready_ship', 'shipped', 'delivered']
@@ -2088,6 +2097,27 @@ def update_shipment(shipment_id: str,
             if has_oversized is not None:
                 updates.append("has_oversized = %s")
                 params.append(has_oversized)
+            
+            # Li Delivery fields
+            if li_quote_price is not None:
+                updates.append("li_quote_price = %s")
+                params.append(li_quote_price)
+            
+            if li_customer_price is not None:
+                updates.append("li_customer_price = %s")
+                params.append(li_customer_price)
+            
+            if actual_cost is not None:
+                updates.append("actual_cost = %s")
+                params.append(actual_cost)
+            
+            if quote_url is not None:
+                updates.append("quote_url = %s")
+                params.append(quote_url)
+            
+            if tracking_number is not None:
+                updates.append("tracking_number = %s")
+                params.append(tracking_number)
             
             if not updates:
                 return {"status": "ok", "message": "No updates provided"}
