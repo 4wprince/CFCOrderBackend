@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.8.0
+CFC Order Workflow Backend - v5.8.1
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.8.0")
+app = FastAPI(title="CFC Order Workflow", version="5.8.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -279,7 +279,7 @@ INSERT INTO trusted_customers (customer_name, company_name, notes) VALUES
 ON CONFLICT DO NOTHING;
 
 CREATE TABLE orders (
-    order_id VARCHAR(20) PRIMARY KEY,
+    order_id VARCHAR(50) PRIMARY KEY,
     
     -- Customer info
     customer_name VARCHAR(255),
@@ -297,6 +297,7 @@ CREATE TABLE orders (
     -- Order details
     order_date TIMESTAMP WITH TIME ZONE,
     order_total DECIMAL(10,2),
+    total_weight DECIMAL(10,2),
     comments TEXT,
     
     -- Warehouses (extracted from SKU prefixes, up to 4)
@@ -351,7 +352,7 @@ CREATE TABLE orders (
 -- Alerts/flags table (after orders so foreign key works)
 CREATE TABLE order_alerts (
     id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
     alert_type VARCHAR(50) NOT NULL,
     alert_message TEXT,
     is_resolved BOOLEAN DEFAULT FALSE,
@@ -364,7 +365,7 @@ CREATE INDEX idx_alerts_unresolved ON order_alerts(is_resolved) WHERE NOT is_res
 
 CREATE TABLE order_line_items (
     id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
     sku VARCHAR(100),
     sku_prefix VARCHAR(20),
     product_name TEXT,
@@ -376,7 +377,7 @@ CREATE TABLE order_line_items (
 
 CREATE TABLE order_events (
     event_id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
     event_type VARCHAR(50) NOT NULL,
     event_data JSONB,
     source VARCHAR(50),
@@ -386,7 +387,7 @@ CREATE TABLE order_events (
 -- Email snippets for AI summary
 CREATE TABLE order_email_snippets (
     id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
     email_from VARCHAR(255),
     email_to VARCHAR(255),
     email_subject VARCHAR(500),
@@ -399,7 +400,7 @@ CREATE TABLE order_email_snippets (
 -- Shipments table - each warehouse in an order is a separate shipment
 CREATE TABLE order_shipments (
     id SERIAL PRIMARY KEY,
-    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+    order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
     shipment_id VARCHAR(50) NOT NULL UNIQUE,  -- e.g., "5307-Li"
     warehouse VARCHAR(100) NOT NULL,
     status VARCHAR(50) DEFAULT 'needs_order',  -- needs_order, at_warehouse, needs_bol, ready_ship, shipped, delivered
@@ -825,6 +826,7 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
     
     # Totals
     order_total = float(order.get('gross_total', 0) or 0)
+    total_weight = float(order.get('total_weight', 0) or 0)
     
     # Order date
     submitted_at = order.get('submitted_at')
@@ -888,10 +890,10 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
                 INSERT INTO orders (
                     order_id, order_date, customer_name, company_name,
                     street, street2, city, state, zip_code, phone, email,
-                    comments, order_total, warehouse_1, warehouse_2, warehouse_3, warehouse_4,
+                    comments, order_total, total_weight, warehouse_1, warehouse_2, warehouse_3, warehouse_4,
                     is_trusted_customer
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (order_id) DO UPDATE SET
                     customer_name = EXCLUDED.customer_name,
@@ -905,6 +907,7 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
                     email = EXCLUDED.email,
                     comments = EXCLUDED.comments,
                     order_total = EXCLUDED.order_total,
+                    total_weight = EXCLUDED.total_weight,
                     warehouse_1 = COALESCE(orders.warehouse_1, EXCLUDED.warehouse_1),
                     warehouse_2 = COALESCE(orders.warehouse_2, EXCLUDED.warehouse_2),
                     warehouse_3 = COALESCE(orders.warehouse_3, EXCLUDED.warehouse_3),
@@ -915,7 +918,7 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
             """, (
                 order_id, order_date, customer_name, company_name,
                 street, street2, city, state, zip_code, phone, email,
-                comments, order_total, warehouse_1, warehouse_2, warehouse_3, warehouse_4,
+                comments, order_total, total_weight, warehouse_1, warehouse_2, warehouse_3, warehouse_4,
                 is_trusted
             ))
             result = cur.fetchone()
@@ -1037,7 +1040,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.8.0",
+        "version": "5.8.1",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1051,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.8.0"}
+    return {"status": "ok", "version": "5.8.1"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1058,7 +1061,7 @@ def create_shipments_table():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS order_shipments (
                     id SERIAL PRIMARY KEY,
-                    order_id VARCHAR(20) REFERENCES orders(order_id) ON DELETE CASCADE,
+                    order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
                     shipment_id VARCHAR(50) NOT NULL UNIQUE,
                     warehouse VARCHAR(100) NOT NULL,
                     status VARCHAR(50) DEFAULT 'needs_order',
@@ -1193,6 +1196,20 @@ def recreate_order_status_view():
             """)
             conn.commit()
     return {"status": "ok", "message": "order_status view recreated"}
+
+@app.post("/add-weight-column")
+def add_weight_column():
+    """Add total_weight column to orders table"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("ALTER TABLE orders ADD COLUMN total_weight DECIMAL(10,2)")
+                conn.commit()
+                return {"status": "ok", "message": "total_weight column added"}
+            except Exception as e:
+                if "already exists" in str(e):
+                    return {"status": "ok", "message": "total_weight column already exists"}
+                return {"status": "error", "message": str(e)}
 
 @app.get("/debug/orders-columns")
 def debug_orders_columns():
@@ -2199,8 +2216,9 @@ def get_rl_quote_data(shipment_id: str):
                 is_single_warehouse = wh_count and wh_count['warehouse_count'] <= 1
                 
                 # Get order total weight if available
-                cur.execute("SELECT order_total FROM orders WHERE order_id = %s", (shipment['order_id'],))
+                cur.execute("SELECT total_weight FROM orders WHERE order_id = %s", (shipment['order_id'],))
                 order_row = cur.fetchone()
+                order_weight = float(order_row['total_weight']) if order_row and order_row.get('total_weight') else 0
                 
                 # Clean ZIP code - strip to 5 digits
                 dest_zip = shipment.get('zip_code') or ''
@@ -2215,9 +2233,9 @@ def get_rl_quote_data(shipment_id: str):
                 
                 if shipment_weight:
                     weight_note = "from shipment"
-                elif is_single_warehouse and total_weight > 0:
-                    shipment_weight = round(total_weight, 1)
-                    weight_note = "calculated from items"
+                elif is_single_warehouse and order_weight > 0:
+                    shipment_weight = round(order_weight, 1)
+                    weight_note = "from order"
                 elif not is_single_warehouse:
                     needs_manual = True
                     weight_note = "Multi-warehouse - enter weight for this shipment"
