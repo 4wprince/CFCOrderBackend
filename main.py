@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.1
+CFC Order Workflow Backend - v5.7.2
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.1")
+app = FastAPI(title="CFC Order Workflow", version="5.7.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.1",
+        "version": "5.7.2",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.1"}
+    return {"status": "ok", "version": "5.7.2"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -2055,7 +2055,7 @@ def get_rl_quote_data(shipment_id: str):
                 
                 # Get line items for this warehouse to check total weight and oversized
                 cur.execute("""
-                    SELECT sku, description, quantity, weight
+                    SELECT sku, product_name, quantity
                     FROM order_line_items
                     WHERE order_id = %s AND warehouse = %s
                 """, (shipment['order_id'], warehouse))
@@ -2067,18 +2067,12 @@ def get_rl_quote_data(shipment_id: str):
                 oversized_items = []
                 
                 for item in line_items:
-                    if item.get('weight'):
-                        try:
-                            total_weight += float(item['weight']) * int(item.get('quantity', 1))
-                        except:
-                            pass
-                    
-                    # Check for oversized keywords in description
-                    desc = (item.get('description') or '').upper()
+                    # Check for oversized keywords in product_name
+                    desc = (item.get('product_name') or '').upper()
                     for keyword in OVERSIZED_KEYWORDS:
                         if keyword in desc:
                             has_oversized = True
-                            oversized_items.append(f"{item.get('sku')}: {item.get('description')}")
+                            oversized_items.append(f"{item.get('sku')}: {item.get('product_name')}")
                             break
                 
                 # Check if single warehouse order
