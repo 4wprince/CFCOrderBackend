@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.7
+CFC Order Workflow Backend - v5.7.8
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.7")
+app = FastAPI(title="CFC Order Workflow", version="5.7.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.7",
+        "version": "5.7.8",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.7"}
+    return {"status": "ok", "version": "5.7.8"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1177,6 +1177,7 @@ def recreate_order_status_view():
                         WHEN payment_link_sent AND NOT payment_received THEN 'awaiting_payment'
                         ELSE 'needs_payment_link'
                     END as current_status,
+                    EXTRACT(DAY FROM NOW() - order_date)::INTEGER as days_open,
                     payment_link_sent,
                     payment_received,
                     sent_to_warehouse,
