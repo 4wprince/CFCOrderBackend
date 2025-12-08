@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.5
+CFC Order Workflow Backend - v5.7.6
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.5")
+app = FastAPI(title="CFC Order Workflow", version="5.7.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.5",
+        "version": "5.7.6",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.5"}
+    return {"status": "ok", "version": "5.7.6"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1113,14 +1113,41 @@ def fix_order_id_length():
         with conn.cursor() as cur:
             results = []
             
-            # First, drop any views that depend on order_id
+            # First, find and drop ALL views that might depend on orders
             try:
-                cur.execute("DROP VIEW IF EXISTS order_details_view CASCADE")
-                results.append("Dropped views")
+                cur.execute("""
+                    SELECT viewname FROM pg_views 
+                    WHERE schemaname = 'public'
+                """)
+                views = cur.fetchall()
+                for view in views:
+                    try:
+                        cur.execute(f"DROP VIEW IF EXISTS {view[0]} CASCADE")
+                        results.append(f"Dropped view: {view[0]}")
+                    except:
+                        pass
             except Exception as e:
-                results.append(f"View drop: {str(e)}")
+                results.append(f"View lookup: {str(e)}")
             
-            # Alter order_id columns in all tables
+            # Also drop any rules
+            try:
+                cur.execute("""
+                    SELECT rulename, tablename FROM pg_rules 
+                    WHERE schemaname = 'public'
+                """)
+                rules = cur.fetchall()
+                for rule in rules:
+                    try:
+                        cur.execute(f"DROP RULE IF EXISTS {rule[0]} ON {rule[1]} CASCADE")
+                        results.append(f"Dropped rule: {rule[0]}")
+                    except:
+                        pass
+            except Exception as e:
+                results.append(f"Rule lookup: {str(e)}")
+            
+            conn.commit()
+            
+            # Now alter order_id columns in all tables
             tables = ['orders', 'order_status', 'order_line_items', 'order_events', 'order_shipments']
             for table in tables:
                 try:
