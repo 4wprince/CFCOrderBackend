@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.9
+CFC Order Workflow Backend - v5.8.0
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.9")
+app = FastAPI(title="CFC Order Workflow", version="5.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.9",
+        "version": "5.8.0",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.9"}
+    return {"status": "ok", "version": "5.8.0"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -2236,7 +2236,9 @@ def get_rl_quote_data(shipment_id: str):
                         "street": shipment.get('street') or '',
                         "city": shipment.get('city') or '',
                         "state": shipment.get('state') or '',
-                        "zip": dest_zip
+                        "zip": dest_zip,
+                        "email": shipment.get('email') or '',
+                        "phone": shipment.get('phone') or ''
                     },
                     "weight": {
                         "value": shipment_weight,
