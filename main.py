@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.8.1
+CFC Order Workflow Backend - v5.8.2
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.8.1")
+app = FastAPI(title="CFC Order Workflow", version="5.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1040,7 +1040,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.8.1",
+        "version": "5.8.2",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1051,7 +1051,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.8.1"}
+    return {"status": "ok", "version": "5.8.2"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -2158,10 +2158,10 @@ def get_rl_quote_data(shipment_id: str):
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Get shipment and order info - use SELECT * to avoid column issues
+                # Get shipment and order info
                 cur.execute("""
                     SELECT s.*, o.customer_name, o.company_name, o.street, o.city, o.state, o.zip_code,
-                           o.phone, o.email, o.order_total
+                           o.phone, o.email, o.order_total, o.total_weight
                     FROM order_shipments s
                     JOIN orders o ON s.order_id = o.order_id
                     WHERE s.shipment_id = %s
@@ -2215,10 +2215,8 @@ def get_rl_quote_data(shipment_id: str):
                 wh_count = cur.fetchone()
                 is_single_warehouse = wh_count and wh_count['warehouse_count'] <= 1
                 
-                # Get order total weight if available
-                cur.execute("SELECT total_weight FROM orders WHERE order_id = %s", (shipment['order_id'],))
-                order_row = cur.fetchone()
-                order_weight = float(order_row['total_weight']) if order_row and order_row.get('total_weight') else 0
+                # Get order total weight directly from the joined query
+                order_weight = float(shipment['total_weight']) if shipment.get('total_weight') else 0
                 
                 # Clean ZIP code - strip to 5 digits
                 dest_zip = shipment.get('zip_code') or ''
