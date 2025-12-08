@@ -101,10 +101,33 @@ SUPPLIER_INFO = {
         'address': '1807 48th Ave E Unit 110, Palmetto FL 34221',
         'contact': 'Kathryn Belfiore (941) 479-8070',
         'email': 'kbelfiore@ghicabinets.com'
+    },
+    'Linda': {
+        'name': 'Linda / Dealer Cabinetry',
+        'address': '202 West Georgia Ave, Bremen GA 30110',
+        'contact': 'Linda Yang (678) 821-3505',
+        'email': 'linda@dealercabinetry.com'
     }
 }
 
-app = FastAPI(title="CFC Order Workflow", version="5.6.0")
+# Warehouse ZIP codes for shipping quotes
+WAREHOUSE_ZIPS = {
+    'LI': '32148',
+    'DL': '32256',
+    'ROC': '30071',
+    'Go Bravura': '77066',
+    'Love-Milestone': '32824',
+    'Cabinet & Stone': '77043',
+    'DuraStone': '77037',
+    'L&C Cabinetry': '23454',
+    'GHI': '34221',
+    'Linda': '30110'
+}
+
+# Keywords that indicate oversized shipment (need dimensions on RL quote)
+OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
+
+app = FastAPI(title="CFC Order Workflow", version="5.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1014,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.6.1",
+        "version": "5.7.0",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1025,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.6.1"}
+    return {"status": "ok", "version": "5.7.0"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1056,6 +1079,32 @@ def create_shipments_table():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_order ON order_shipments(order_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shipments_id ON order_shipments(shipment_id)")
     return {"status": "ok", "message": "order_shipments table created"}
+
+@app.post("/add-rl-fields")
+def add_rl_shipping_fields():
+    """Add RL Carriers shipping fields to order_shipments table"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Add RL quote fields
+            fields_to_add = [
+                ("origin_zip", "VARCHAR(10)"),
+                ("rl_quote_number", "VARCHAR(50)"),
+                ("rl_quote_price", "DECIMAL(10,2)"),
+                ("rl_customer_price", "DECIMAL(10,2)"),
+                ("rl_invoice_amount", "DECIMAL(10,2)"),
+                ("has_oversized", "BOOLEAN DEFAULT FALSE")
+            ]
+            
+            for field_name, field_type in fields_to_add:
+                try:
+                    cur.execute(f"ALTER TABLE order_shipments ADD COLUMN {field_name} {field_type}")
+                except Exception as e:
+                    # Column might already exist
+                    conn.rollback()
+                    pass
+            
+            conn.commit()
+    return {"status": "ok", "message": "RL shipping fields added to order_shipments"}
 
 @app.post("/init-db")
 def init_db():
@@ -1826,7 +1875,13 @@ def update_shipment(shipment_id: str,
                     pro_number: Optional[str] = None,
                     weight: Optional[float] = None,
                     ship_method: Optional[str] = None,
-                    bol_sent: Optional[bool] = None):
+                    bol_sent: Optional[bool] = None,
+                    origin_zip: Optional[str] = None,
+                    rl_quote_number: Optional[str] = None,
+                    rl_quote_price: Optional[float] = None,
+                    rl_customer_price: Optional[float] = None,
+                    rl_invoice_amount: Optional[float] = None,
+                    has_oversized: Optional[bool] = None):
     """Update shipment fields"""
     
     valid_statuses = ['needs_order', 'at_warehouse', 'needs_bol', 'ready_ship', 'shipped', 'delivered']
@@ -1877,6 +1932,31 @@ def update_shipment(shipment_id: str,
                 params.append(bol_sent)
                 if bol_sent:
                     updates.append("bol_sent_at = NOW()")
+            
+            # RL Carriers fields
+            if origin_zip is not None:
+                updates.append("origin_zip = %s")
+                params.append(origin_zip)
+            
+            if rl_quote_number is not None:
+                updates.append("rl_quote_number = %s")
+                params.append(rl_quote_number)
+            
+            if rl_quote_price is not None:
+                updates.append("rl_quote_price = %s")
+                params.append(rl_quote_price)
+            
+            if rl_customer_price is not None:
+                updates.append("rl_customer_price = %s")
+                params.append(rl_customer_price)
+            
+            if rl_invoice_amount is not None:
+                updates.append("rl_invoice_amount = %s")
+                params.append(rl_invoice_amount)
+            
+            if has_oversized is not None:
+                updates.append("has_oversized = %s")
+                params.append(has_oversized)
             
             if not updates:
                 return {"status": "ok", "message": "No updates provided"}
@@ -1940,6 +2020,94 @@ def add_warehouse_mapping(mapping: WarehouseMappingUpdate):
 # =============================================================================
 # STATUS SUMMARY
 # =============================================================================
+
+@app.get("/shipments/{shipment_id}/rl-quote-data")
+def get_rl_quote_data(shipment_id: str):
+    """Get pre-populated data for RL Carriers quote"""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get shipment and order info
+            cur.execute("""
+                SELECT s.*, o.customer_name, o.company_name, o.street, o.city, o.state, o.zip_code,
+                       o.phone, o.email, o.order_total
+                FROM order_shipments s
+                JOIN orders o ON s.order_id = o.order_id
+                WHERE s.shipment_id = %s
+            """, (shipment_id,))
+            
+            shipment = cur.fetchone()
+            if not shipment:
+                raise HTTPException(status_code=404, detail="Shipment not found")
+            
+            # Get warehouse zip
+            warehouse = shipment['warehouse']
+            origin_zip = WAREHOUSE_ZIPS.get(warehouse, '')
+            
+            # Get line items for this warehouse to check total weight and oversized
+            cur.execute("""
+                SELECT sku, description, quantity, weight
+                FROM order_line_items
+                WHERE order_id = %s AND warehouse = %s
+            """, (shipment['order_id'], warehouse))
+            line_items = cur.fetchall()
+            
+            # Calculate weight for this shipment's items
+            total_weight = 0
+            has_oversized = False
+            oversized_items = []
+            
+            for item in line_items:
+                if item.get('weight'):
+                    total_weight += float(item['weight']) * int(item.get('quantity', 1))
+                
+                # Check for oversized keywords in description
+                desc = (item.get('description') or '').upper()
+                for keyword in OVERSIZED_KEYWORDS:
+                    if keyword in desc:
+                        has_oversized = True
+                        oversized_items.append(f"{item.get('sku')}: {item.get('description')}")
+                        break
+            
+            # If single warehouse order, we might have total weight from order
+            # Get order-level weight if available
+            cur.execute("""
+                SELECT COUNT(DISTINCT warehouse) as warehouse_count
+                FROM order_line_items
+                WHERE order_id = %s
+            """, (shipment['order_id'],))
+            wh_count = cur.fetchone()
+            is_single_warehouse = wh_count and wh_count['warehouse_count'] <= 1
+            
+            return {
+                "status": "ok",
+                "shipment_id": shipment_id,
+                "order_id": shipment['order_id'],
+                "warehouse": warehouse,
+                "origin_zip": origin_zip,
+                "destination": {
+                    "name": shipment['company_name'] or shipment['customer_name'],
+                    "street": shipment['street'],
+                    "city": shipment['city'],
+                    "state": shipment['state'],
+                    "zip": shipment['zip_code']
+                },
+                "weight": {
+                    "calculated": round(total_weight, 1) if total_weight > 0 else None,
+                    "shipment_weight": float(shipment['weight']) if shipment.get('weight') else None,
+                    "is_single_warehouse": is_single_warehouse,
+                    "needs_manual_entry": not is_single_warehouse and not shipment.get('weight')
+                },
+                "oversized": {
+                    "detected": has_oversized,
+                    "items": oversized_items
+                },
+                "existing_quote": {
+                    "quote_number": shipment.get('rl_quote_number'),
+                    "quote_price": float(shipment['rl_quote_price']) if shipment.get('rl_quote_price') else None,
+                    "customer_price": float(shipment['rl_customer_price']) if shipment.get('rl_customer_price') else None
+                },
+                "rl_quote_url": "https://www.rlcarriers.com/freight/shipping/rate-quote"
+            }
 
 @app.get("/orders/status/summary")
 def status_summary():
