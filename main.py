@@ -1,8 +1,8 @@
 """
-CFC Order Workflow Backend - v5.6.0
+CFC Order Workflow Backend - v5.7.1
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
-AI Summary with Anthropic Claude API.
+AI Summary with Anthropic Claude API. RL Carriers quote helper.
 """
 
 import os
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.0")
+app = FastAPI(title="CFC Order Workflow", version="5.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.0",
+        "version": "5.7.1",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.0"}
+    return {"status": "ok", "version": "5.7.1"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -2024,90 +2024,104 @@ def add_warehouse_mapping(mapping: WarehouseMappingUpdate):
 @app.get("/shipments/{shipment_id}/rl-quote-data")
 def get_rl_quote_data(shipment_id: str):
     """Get pre-populated data for RL Carriers quote"""
-    with get_db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get shipment and order info
-            cur.execute("""
-                SELECT s.*, o.customer_name, o.company_name, o.street, o.city, o.state, o.zip_code,
-                       o.phone, o.email, o.order_total
-                FROM order_shipments s
-                JOIN orders o ON s.order_id = o.order_id
-                WHERE s.shipment_id = %s
-            """, (shipment_id,))
-            
-            shipment = cur.fetchone()
-            if not shipment:
-                raise HTTPException(status_code=404, detail="Shipment not found")
-            
-            # Get warehouse zip
-            warehouse = shipment['warehouse']
-            origin_zip = WAREHOUSE_ZIPS.get(warehouse, '')
-            
-            # Get line items for this warehouse to check total weight and oversized
-            cur.execute("""
-                SELECT sku, description, quantity, weight
-                FROM order_line_items
-                WHERE order_id = %s AND warehouse = %s
-            """, (shipment['order_id'], warehouse))
-            line_items = cur.fetchall()
-            
-            # Calculate weight for this shipment's items
-            total_weight = 0
-            has_oversized = False
-            oversized_items = []
-            
-            for item in line_items:
-                if item.get('weight'):
-                    total_weight += float(item['weight']) * int(item.get('quantity', 1))
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Get shipment and order info - use SELECT * to avoid column issues
+                cur.execute("""
+                    SELECT s.*, o.customer_name, o.company_name, o.street, o.city, o.state, o.zip_code,
+                           o.phone, o.email, o.order_total
+                    FROM order_shipments s
+                    JOIN orders o ON s.order_id = o.order_id
+                    WHERE s.shipment_id = %s
+                """, (shipment_id,))
                 
-                # Check for oversized keywords in description
-                desc = (item.get('description') or '').upper()
-                for keyword in OVERSIZED_KEYWORDS:
-                    if keyword in desc:
-                        has_oversized = True
-                        oversized_items.append(f"{item.get('sku')}: {item.get('description')}")
-                        break
-            
-            # If single warehouse order, we might have total weight from order
-            # Get order-level weight if available
-            cur.execute("""
-                SELECT COUNT(DISTINCT warehouse) as warehouse_count
-                FROM order_line_items
-                WHERE order_id = %s
-            """, (shipment['order_id'],))
-            wh_count = cur.fetchone()
-            is_single_warehouse = wh_count and wh_count['warehouse_count'] <= 1
-            
-            return {
-                "status": "ok",
-                "shipment_id": shipment_id,
-                "order_id": shipment['order_id'],
-                "warehouse": warehouse,
-                "origin_zip": origin_zip,
-                "destination": {
-                    "name": shipment['company_name'] or shipment['customer_name'],
-                    "street": shipment['street'],
-                    "city": shipment['city'],
-                    "state": shipment['state'],
-                    "zip": shipment['zip_code']
-                },
-                "weight": {
-                    "calculated": round(total_weight, 1) if total_weight > 0 else None,
-                    "shipment_weight": float(shipment['weight']) if shipment.get('weight') else None,
-                    "is_single_warehouse": is_single_warehouse,
-                    "needs_manual_entry": not is_single_warehouse and not shipment.get('weight')
-                },
-                "oversized": {
-                    "detected": has_oversized,
-                    "items": oversized_items
-                },
-                "existing_quote": {
-                    "quote_number": shipment.get('rl_quote_number'),
-                    "quote_price": float(shipment['rl_quote_price']) if shipment.get('rl_quote_price') else None,
-                    "customer_price": float(shipment['rl_customer_price']) if shipment.get('rl_customer_price') else None
-                },
-                "rl_quote_url": "https://www.rlcarriers.com/freight/shipping/rate-quote"
-            }
+                shipment = cur.fetchone()
+                if not shipment:
+                    return {"status": "error", "message": f"Shipment {shipment_id} not found"}
+                
+                # Get warehouse zip
+                warehouse = shipment['warehouse']
+                origin_zip = WAREHOUSE_ZIPS.get(warehouse, '')
+                
+                # If warehouse not in our list, try fuzzy match
+                if not origin_zip:
+                    warehouse_lower = warehouse.lower().replace(' ', '').replace('&', '').replace('-', '')
+                    for wh_name, wh_zip in WAREHOUSE_ZIPS.items():
+                        wh_compare = wh_name.lower().replace(' ', '').replace('&', '').replace('-', '')
+                        if wh_compare == warehouse_lower or warehouse_lower in wh_compare or wh_compare in warehouse_lower:
+                            origin_zip = wh_zip
+                            break
+                
+                # Get line items for this warehouse to check total weight and oversized
+                cur.execute("""
+                    SELECT sku, description, quantity, weight
+                    FROM order_line_items
+                    WHERE order_id = %s AND warehouse = %s
+                """, (shipment['order_id'], warehouse))
+                line_items = cur.fetchall()
+                
+                # Calculate weight for this shipment's items
+                total_weight = 0
+                has_oversized = False
+                oversized_items = []
+                
+                for item in line_items:
+                    if item.get('weight'):
+                        try:
+                            total_weight += float(item['weight']) * int(item.get('quantity', 1))
+                        except:
+                            pass
+                    
+                    # Check for oversized keywords in description
+                    desc = (item.get('description') or '').upper()
+                    for keyword in OVERSIZED_KEYWORDS:
+                        if keyword in desc:
+                            has_oversized = True
+                            oversized_items.append(f"{item.get('sku')}: {item.get('description')}")
+                            break
+                
+                # Check if single warehouse order
+                cur.execute("""
+                    SELECT COUNT(DISTINCT warehouse) as warehouse_count
+                    FROM order_line_items
+                    WHERE order_id = %s AND warehouse IS NOT NULL
+                """, (shipment['order_id'],))
+                wh_count = cur.fetchone()
+                is_single_warehouse = wh_count and wh_count['warehouse_count'] <= 1
+                
+                return {
+                    "status": "ok",
+                    "shipment_id": shipment_id,
+                    "order_id": shipment['order_id'],
+                    "warehouse": warehouse,
+                    "origin_zip": origin_zip,
+                    "destination": {
+                        "name": shipment.get('company_name') or shipment.get('customer_name') or '',
+                        "street": shipment.get('street') or '',
+                        "city": shipment.get('city') or '',
+                        "state": shipment.get('state') or '',
+                        "zip": shipment.get('zip_code') or ''
+                    },
+                    "weight": {
+                        "calculated": round(total_weight, 1) if total_weight > 0 else None,
+                        "shipment_weight": float(shipment['weight']) if shipment.get('weight') else None,
+                        "is_single_warehouse": is_single_warehouse,
+                        "needs_manual_entry": not is_single_warehouse and not shipment.get('weight')
+                    },
+                    "oversized": {
+                        "detected": has_oversized,
+                        "items": oversized_items
+                    },
+                    "existing_quote": {
+                        "quote_number": shipment.get('rl_quote_number'),
+                        "quote_price": float(shipment['rl_quote_price']) if shipment.get('rl_quote_price') else None,
+                        "customer_price": float(shipment['rl_customer_price']) if shipment.get('rl_customer_price') else None
+                    },
+                    "rl_quote_url": "https://www.rlcarriers.com/freight/shipping/rate-quote"
+                }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.get("/orders/status/summary")
 def status_summary():
