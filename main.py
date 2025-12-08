@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.8.3
+CFC Order Workflow Backend - v5.8.4
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.8.3")
+app = FastAPI(title="CFC Order Workflow", version="5.8.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1040,7 +1040,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.8.3",
+        "version": "5.8.4",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1051,7 +1051,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.8.3"}
+    return {"status": "ok", "version": "5.8.4"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1099,7 +1099,10 @@ def add_rl_shipping_fields():
                 ("li_quote_price", "DECIMAL(10,2)"),
                 ("li_customer_price", "DECIMAL(10,2)"),
                 ("actual_cost", "DECIMAL(10,2)"),
-                ("quote_url", "TEXT")
+                ("quote_url", "TEXT"),
+                ("quote_price", "DECIMAL(10,2)"),
+                ("customer_price", "DECIMAL(10,2)"),
+                ("tracking_number", "VARCHAR(100)")
             ]
             
             for field_name, field_type in fields_to_add:
@@ -2021,7 +2024,9 @@ def update_shipment(shipment_id: str,
                     li_customer_price: Optional[float] = None,
                     actual_cost: Optional[float] = None,
                     quote_url: Optional[str] = None,
-                    tracking_number: Optional[str] = None):
+                    tracking_number: Optional[str] = None,
+                    quote_price: Optional[float] = None,
+                    customer_price: Optional[float] = None):
     """Update shipment fields"""
     
     valid_statuses = ['needs_order', 'at_warehouse', 'needs_bol', 'ready_ship', 'shipped', 'delivered']
@@ -2118,6 +2123,14 @@ def update_shipment(shipment_id: str,
             if tracking_number is not None:
                 updates.append("tracking_number = %s")
                 params.append(tracking_number)
+            
+            if quote_price is not None:
+                updates.append("quote_price = %s")
+                params.append(quote_price)
+            
+            if customer_price is not None:
+                updates.append("customer_price = %s")
+                params.append(customer_price)
             
             if not updates:
                 return {"status": "ok", "message": "No updates provided"}
