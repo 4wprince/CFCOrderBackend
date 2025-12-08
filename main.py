@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.7.3
+CFC Order Workflow Backend - v5.7.4
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Supplier sheet support with line items.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -127,7 +127,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.7.3")
+app = FastAPI(title="CFC Order Workflow", version="5.7.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1037,7 +1037,7 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.7.3",
+        "version": "5.7.4",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
@@ -1048,7 +1048,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.7.3"}
+    return {"status": "ok", "version": "5.7.4"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1105,6 +1105,23 @@ def add_rl_shipping_fields():
             
             conn.commit()
     return {"status": "ok", "message": "RL shipping fields added to order_shipments"}
+
+@app.post("/fix-order-id-length")
+def fix_order_id_length():
+    """Increase order_id column length from VARCHAR(20) to VARCHAR(50)"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Alter order_id columns in all tables
+            tables = ['orders', 'order_status', 'order_line_items', 'order_events', 'order_shipments']
+            results = []
+            for table in tables:
+                try:
+                    cur.execute(f"ALTER TABLE {table} ALTER COLUMN order_id TYPE VARCHAR(50)")
+                    results.append(f"{table}: updated")
+                except Exception as e:
+                    results.append(f"{table}: {str(e)}")
+            conn.commit()
+    return {"status": "ok", "results": results}
 
 @app.post("/init-db")
 def init_db():
