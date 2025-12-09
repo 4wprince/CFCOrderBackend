@@ -2311,7 +2311,8 @@ def get_rl_quote_data(shipment_id: str):
                     "existing_quote": {
                         "quote_number": shipment.get('rl_quote_number'),
                         "quote_price": float(shipment['rl_quote_price']) if shipment.get('rl_quote_price') else None,
-                        "customer_price": float(shipment['rl_customer_price']) if shipment.get('rl_customer_price') else None
+                        "customer_price": float(shipment['rl_customer_price']) if shipment.get('rl_customer_price') else None,
+                        "quote_url": shipment.get('quote_url')
                     },
                     "rl_quote_url": "https://www.rlcarriers.com/freight/shipping/rate-quote"
                 }
