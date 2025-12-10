@@ -178,7 +178,7 @@ DROP TABLE IF EXISTS warehouse_mapping CASCADE;
 DROP TABLE IF EXISTS trusted_customers CASCADE;
 
 CREATE TABLE warehouse_mapping (
-    sku_prefix VARCHAR(20) PRIMARY KEY,
+    sku_prefix VARCHAR(100) PRIMARY KEY,
     warehouse_name VARCHAR(100) NOT NULL,
     warehouse_code VARCHAR(20),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -367,7 +367,7 @@ CREATE TABLE order_line_items (
     id SERIAL PRIMARY KEY,
     order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE CASCADE,
     sku VARCHAR(100),
-    sku_prefix VARCHAR(20),
+    sku_prefix VARCHAR(100),
     product_name TEXT,
     price DECIMAL(10,2),
     quantity INTEGER,
@@ -1154,13 +1154,28 @@ def fix_shipment_columns():
 
 @app.post("/fix-sku-columns")
 def fix_sku_columns():
-    """Fix SKU column lengths"""
+    """Fix SKU column lengths in all tables"""
     with get_db() as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute("ALTER TABLE sku_warehouse_map ALTER COLUMN sku_prefix TYPE VARCHAR(100)")
                 conn.commit()
-            except Exception as e:
+            except:
+                conn.rollback()
+            try:
+                cur.execute("ALTER TABLE warehouse_mapping ALTER COLUMN sku_prefix TYPE VARCHAR(100)")
+                conn.commit()
+            except:
+                conn.rollback()
+            try:
+                cur.execute("ALTER TABLE order_items ALTER COLUMN sku_prefix TYPE VARCHAR(100)")
+                conn.commit()
+            except:
+                conn.rollback()
+            try:
+                cur.execute("ALTER TABLE order_line_items ALTER COLUMN sku_prefix TYPE VARCHAR(100)")
+                conn.commit()
+            except:
                 conn.rollback()
     return {"status": "ok", "message": "SKU columns fixed"}
 
