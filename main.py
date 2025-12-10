@@ -2454,6 +2454,16 @@ def add_trusted_customer(customer_name: str, company_name: Optional[str] = None,
             new_id = cur.fetchone()[0]
             return {"status": "ok", "id": new_id}
 
+@app.delete("/orders/{order_id}")
+def delete_order(order_id: str):
+    """Delete an order and its shipments"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM order_shipments WHERE order_id = %s", (order_id,))
+            cur.execute("DELETE FROM order_line_items WHERE order_id = %s", (order_id,))
+            cur.execute("DELETE FROM orders WHERE order_id = %s", (order_id,))
+            conn.commit()
+    return {"status": "ok", "message": f"Order {order_id} deleted"}
 @app.delete("/trusted-customers/{customer_id}")
 def remove_trusted_customer(customer_id: int):
     """Remove a trusted customer"""
