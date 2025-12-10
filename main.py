@@ -1133,24 +1133,19 @@ def add_ps_fields():
                 conn.commit()
             except:
                 conn.rollback()
-    return {"status": "ok", "message": "PS fields added"}
+       return {"status": "ok", "message": "Shipment columns fixed"}
 
-@app.post("/fix-shipment-columns")
-def fix_shipment_columns():
-    """Fix column lengths in order_shipments table"""
+@app.post("/fix-sku-columns")
+def fix_sku_columns():
+    """Fix SKU column lengths"""
     with get_db() as conn:
         with conn.cursor() as cur:
             try:
-                cur.execute("ALTER TABLE order_shipments ALTER COLUMN order_id TYPE VARCHAR(50)")
+                cur.execute("ALTER TABLE sku_warehouse_map ALTER COLUMN sku_prefix TYPE VARCHAR(100)")
                 conn.commit()
             except Exception as e:
                 conn.rollback()
-            try:
-                cur.execute("ALTER TABLE order_shipments ALTER COLUMN shipment_id TYPE VARCHAR(100)")
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-    return {"status": "ok", "message": "Shipment columns fixed"}
+    return {"status": "ok", "message": "SKU columns fixed"}
 
 @app.post("/fix-order-id-length")
 def fix_order_id_length():
