@@ -625,12 +625,12 @@ def parse_b2bwave_email(body: str, subject: str) -> dict:
 def get_warehouses_for_skus(sku_prefixes: List[str]) -> List[str]:
     """Look up warehouse names for given SKU prefixes"""
     if not sku_prefixes:
-    return []
+        return []
     
     warehouses = []
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-           placeholders = ','.join(['%s'] * len(sku_prefixes))
+            placeholders = ','.join(['%s'] * len(sku_prefixes))
             upper_prefixes = [p.upper() for p in sku_prefixes]
             cur.execute(f"""
                 SELECT DISTINCT warehouse_name
