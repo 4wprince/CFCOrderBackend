@@ -1135,6 +1135,23 @@ def add_ps_fields():
                 conn.rollback()
     return {"status": "ok", "message": "PS fields added"}
 
+@app.post("/fix-shipment-columns")
+def fix_shipment_columns():
+    """Fix column lengths in order_shipments table"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("ALTER TABLE order_shipments ALTER COLUMN order_id TYPE VARCHAR(50)")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+            try:
+                cur.execute("ALTER TABLE order_shipments ALTER COLUMN shipment_id TYPE VARCHAR(100)")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+    return {"status": "ok", "message": "Shipment columns fixed"}
+
 @app.post("/fix-order-id-length")
 def fix_order_id_length():
     """Increase order_id column length from VARCHAR(20) to VARCHAR(50)"""
