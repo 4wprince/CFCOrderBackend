@@ -1118,6 +1118,23 @@ def add_rl_shipping_fields():
             conn.commit()
     return {"status": "ok", "message": "Shipping fields added to order_shipments"}
 
+@app.post("/add-ps-fields")
+def add_ps_fields():
+    """Add Pirateship fields to order_shipments table"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("ALTER TABLE order_shipments ADD COLUMN ps_quote_url TEXT")
+                conn.commit()
+            except:
+                conn.rollback()
+            try:
+                cur.execute("ALTER TABLE order_shipments ADD COLUMN ps_quote_price DECIMAL(10,2)")
+                conn.commit()
+            except:
+                conn.rollback()
+    return {"status": "ok", "message": "PS fields added"}
+
 @app.post("/fix-order-id-length")
 def fix_order_id_length():
     """Increase order_id column length from VARCHAR(20) to VARCHAR(50)"""
