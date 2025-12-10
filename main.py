@@ -1101,6 +1101,7 @@ def add_rl_shipping_fields():
                 ("actual_cost", "DECIMAL(10,2)"),
                 ("quote_url", "TEXT"),
                 ("ps_quote_url", "TEXT"),
+                ("ps_quote_price", "DECIMAL(10,2)"),
                 ("quote_price", "DECIMAL(10,2)"),
                 ("customer_price", "DECIMAL(10,2)"),
                 ("tracking_number", "VARCHAR(100)")
@@ -2026,6 +2027,7 @@ def update_shipment(shipment_id: str,
                     actual_cost: Optional[float] = None,
                     quote_url: Optional[str] = None,
                     ps_quote_url: Optional[str] = None,
+                    ps_quote_price: Optional[float] = None,
                     tracking_number: Optional[str] = None,
                     quote_price: Optional[float] = None,
                     customer_price: Optional[float] = None):
@@ -2125,6 +2127,10 @@ def update_shipment(shipment_id: str,
             if ps_quote_url is not None:
                 updates.append("ps_quote_url = %s")
                 params.append(ps_quote_url)
+
+            if ps_quote_price is not None:
+                updates.append("ps_quote_price = %s")
+                params.append(ps_quote_price)
             
             if tracking_number is not None:
                 updates.append("tracking_number = %s")
