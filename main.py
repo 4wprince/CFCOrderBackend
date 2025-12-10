@@ -933,7 +933,7 @@ def sync_order_from_b2bwave(order_data: dict) -> dict:
                 # Look up warehouse for this item
                 item_warehouse = None
                 if prefix:
-                    cur.execute("SELECT warehouse_name FROM warehouse_mapping WHERE sku_prefix = %s", (prefix,))
+                    cur.execute("SELECT warehouse_name FROM warehouse_mapping WHERE UPPER(sku_prefix) = UPPER(%s)", (prefix,))
                     wh_row = cur.fetchone()
                     if wh_row:
                         item_warehouse = wh_row['warehouse_name']
