@@ -2548,3 +2548,5 @@ def check_payment_alerts():
                 alerts_created += 1
     
     return {"status": "ok", "alerts_created": alerts_created}
+#   r e b u i l d  
+ 
