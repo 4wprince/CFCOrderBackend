@@ -746,14 +746,14 @@ def generate_order_summary(order_id: str) -> str:
             if s.get('email_snippet'):
                 context_parts.append(f"  {s['email_snippet'][:300]}")
     
-    # Events
+# Events (filter out sync noise)
     if events:
-        context_parts.append("\nORDER EVENTS:")
-        for e in events:
-            date_str = e['created_at'].strftime('%m/%d %H:%M') if e.get('created_at') else ''
-            context_parts.append(f"- [{date_str}] {e.get('event_type')}")
-    
-    context = "\n".join(context_parts)
+        important_events = [e for e in events if e.get('event_type') not in ('b2bwave_sync', 'auto_sync', 'status_check')]
+        if important_events:
+            context_parts.append("\nORDER EVENTS:")
+            for e in important_events:
+                date_str = e['created_at'].strftime('%m/%d %H:%M') if e.get('created_at') else ''
+                context_parts.append(f"- [{date_str}] {e.get('event_type')}")
     
     # Create prompt
     prompt = f"""Summarize this order's current status concisely.
