@@ -756,20 +756,25 @@ def generate_order_summary(order_id: str) -> str:
                 context_parts.append(f"- [{date_str}] {e.get('event_type')}")
     
     # Create prompt
-    prompt = f"""Summarize this order's current status concisely.
+    prompt = f"""Write a brief order status summary.
 
-INCLUDE:
-- Order progression: placed, invoiced, paid, sent to warehouse, shipped
-- Important emails: warehouse stock issues, customer requests, credits owed
-- Internal notes from our team
-- Next action needed
+Rules:
+- Use simple bullet points (• symbol)
+- NO headers, NO bold text, NO markdown formatting
+- Only include notable information (special requests, issues, credits)
+- Skip obvious info (order total, warehouse names) unless relevant to an issue
+- 2-4 bullets maximum
+- Plain conversational language
+- Always end with "Next action:" if payment pending or action needed
 
-EXCLUDE:
-- System sync events, B2B updates, automated timestamps
-- Routine status checks
-- Technical system activity
+Example good output:
+- Customer will pay by check and pick up (no shipping needed)
+- Next action: Wait for customer pickup with payment
 
-Format: 3-5 short bullet points, plain language, no headers.
+Example bad output (too verbose):
+- **Order Status:** Payment pending
+- **Warehouse:** DL warehouse assigned
+- **System Activity:** Multiple syncs detected
 
 {context}"""
     
