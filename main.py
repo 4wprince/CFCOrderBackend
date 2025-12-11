@@ -746,7 +746,7 @@ def generate_order_summary(order_id: str) -> str:
             if s.get('email_snippet'):
                 context_parts.append(f"  {s['email_snippet'][:300]}")
     
-# Events (filter out sync noise)
+    # Events (filter out sync noise)
     if events:
         important_events = [e for e in events if e.get('event_type') not in ('b2bwave_sync', 'auto_sync', 'status_check')]
         if important_events:
@@ -755,6 +755,8 @@ def generate_order_summary(order_id: str) -> str:
                 date_str = e['created_at'].strftime('%m/%d %H:%M') if e.get('created_at') else ''
                 context_parts.append(f"- [{date_str}] {e.get('event_type')}")
     
+    context = "\n".join(context_parts)    
+
     # Create prompt
     prompt = f"""Write a brief order status summary.
 
@@ -776,8 +778,7 @@ Example bad output (too verbose):
 - **Warehouse:** DL warehouse assigned
 - **System Activity:** Multiple syncs detected
 
-{context}"""
-    
+{context}"""    
     return call_anthropic_api(prompt)
 
 # =============================================================================
