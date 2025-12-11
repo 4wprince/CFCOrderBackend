@@ -756,15 +756,20 @@ def generate_order_summary(order_id: str) -> str:
     context = "\n".join(context_parts)
     
     # Create prompt
-    prompt = f"""Summarize this order's status and any important information in bullet points. 
-Focus on:
-- Current status and what needs to happen next
-- Any issues, questions, or special requests
-- Payment status
-- Shipping/tracking info if available
-- Any notable communications
+    prompt = f"""Summarize this order's current status concisely.
 
-Keep it concise - max 5-7 bullet points.
+INCLUDE:
+- Order progression: placed, invoiced, paid, sent to warehouse, shipped
+- Important emails: warehouse stock issues, customer requests, credits owed
+- Internal notes from our team
+- Next action needed
+
+EXCLUDE:
+- System sync events, B2B updates, automated timestamps
+- Routine status checks
+- Technical system activity
+
+Format: 3-5 short bullet points, plain language, no headers.
 
 {context}"""
     
