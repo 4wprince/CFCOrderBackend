@@ -43,7 +43,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 if DATABASE_URL and "sslmode" not in DATABASE_URL:
-    DATABASE_URL += "?sslmode=require"
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 
 # B2BWave API Config
 B2BWAVE_URL = os.environ.get("B2BWAVE_URL", "").strip().rstrip('/')
@@ -151,14 +151,6 @@ app.add_middleware(
 # Global for tracking last sync
 last_auto_sync = None
 auto_sync_running = False
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # =============================================================================
 # DATABASE
@@ -2676,3 +2668,13 @@ def check_payment_alerts():
                 alerts_created += 1
     
     return {"status": "ok", "alerts_created": alerts_created}
+
+# =============================================================================
+# SERVER STARTUP
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
