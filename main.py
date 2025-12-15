@@ -1,7 +1,7 @@
 """
-CFC Order Workflow Backend - v5.8.4
+CFC Order Workflow Backend - v5.9.0
 All parsing/logic server-side. B2BWave API integration for clean order data.
-Auto-sync every 15 minutes. Supplier sheet support with line items.
+Auto-sync every 15 minutes. Gmail email scanning for status updates.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
 """
 
@@ -11,6 +11,7 @@ import json
 import base64
 import urllib.request
 import urllib.error
+import urllib.parse
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -23,6 +24,16 @@ from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Gmail sync module
+try:
+    from gmail_sync import run_gmail_sync, gmail_configured
+except ImportError:
+    print("[STARTUP] gmail_sync module not found, email sync disabled")
+    def run_gmail_sync(conn, hours_back=2):
+        return {"status": "disabled", "reason": "module_not_found"}
+    def gmail_configured():
+        return False
 
 # =============================================================================
 # CONFIG
@@ -1028,6 +1039,14 @@ def run_auto_sync():
             last_auto_sync = datetime.now(timezone.utc)
             print(f"[AUTO-SYNC] Completed: {synced} orders synced")
             
+            # Run Gmail email sync
+            try:
+                with get_db() as conn:
+                    gmail_results = run_gmail_sync(conn, hours_back=2)
+                    print(f"[AUTO-SYNC] Gmail sync: {gmail_results}")
+            except Exception as e:
+                print(f"[AUTO-SYNC] Gmail sync error: {e}")
+            
         except Exception as e:
             print(f"[AUTO-SYNC] Error: {e}")
         finally:
@@ -1052,12 +1071,16 @@ def root():
     return {
         "status": "ok", 
         "service": "CFC Order Workflow", 
-        "version": "5.8.4",
+        "version": "5.9.0",
         "auto_sync": {
             "enabled": bool(B2BWAVE_URL and B2BWAVE_USERNAME and B2BWAVE_API_KEY),
             "interval_minutes": AUTO_SYNC_INTERVAL_MINUTES,
             "last_sync": last_auto_sync.isoformat() if last_auto_sync else None,
             "running": auto_sync_running
+        },
+        "gmail_sync": {
+            "enabled": gmail_configured()
+        }
         }
     }
 
@@ -1395,6 +1418,23 @@ def sync_from_b2bwave(days_back: int = 14):
         "synced_orders": synced,
         "errors": errors if errors else None
     }
+
+@app.post("/gmail/sync")
+def sync_from_gmail(hours_back: int = 2):
+    """
+    Sync order status updates from Gmail.
+    Scans for: payment links sent, payments received, RL quotes, tracking numbers.
+    Default: last 2 hours of emails.
+    """
+    if not gmail_configured():
+        raise HTTPException(status_code=400, detail="Gmail not configured. Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN environment variables.")
+    
+    try:
+        with get_db() as conn:
+            results = run_gmail_sync(conn, hours_back=hours_back)
+        return {"status": "ok", "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gmail sync error: {str(e)}")
 
 @app.get("/b2bwave/order/{order_id}")
 def get_b2bwave_order(order_id: str):
