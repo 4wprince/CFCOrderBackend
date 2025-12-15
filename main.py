@@ -1,5 +1,5 @@
 """
-CFC Order Workflow Backend - v5.9.0
+CFC Order Workflow Backend - v5.9.1
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Gmail email scanning for status updates.
 AI Summary with Anthropic Claude API. RL Carriers quote helper.
@@ -33,6 +33,20 @@ except ImportError:
     def run_gmail_sync(conn, hours_back=2):
         return {"status": "disabled", "reason": "module_not_found"}
     def gmail_configured():
+        return False
+
+# AI Summary module
+try:
+    from ai_summary import generate_summary, detect_critical_comments, should_regenerate
+    ai_summary_available = True
+except ImportError:
+    print("[STARTUP] ai_summary module not found, using basic summary")
+    ai_summary_available = False
+    def generate_summary(order, snippets=None, events=None):
+        return ("AI summary module not available", [])
+    def detect_critical_comments(text):
+        return []
+    def should_regenerate(order, event_type=None):
         return False
 
 # =============================================================================
@@ -138,7 +152,7 @@ WAREHOUSE_ZIPS = {
 # Keywords that indicate oversized shipment (need dimensions on RL quote)
 OVERSIZED_KEYWORDS = ['OVEN', 'PANTRY', '96"', '96*', 'X96', '96X', '96H', '96 H']
 
-app = FastAPI(title="CFC Order Workflow", version="5.9.0")
+app = FastAPI(title="CFC Order Workflow", version="5.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1072,12 +1086,15 @@ def root():
         },
         "gmail_sync": {
             "enabled": gmail_configured()
+        },
+        "ai_summary": {
+            "enabled": ai_summary_available
         }
     }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.9.0"}
+    return {"status": "ok", "version": "5.9.1"}
 
 @app.post("/create-shipments-table")
 def create_shipments_table():
@@ -1177,6 +1194,39 @@ def fix_shipment_columns():
             except Exception as e:
                 conn.rollback()
     return {"status": "ok", "message": "Shipment columns fixed"}
+
+@app.post("/add-ai-summary-columns")
+def add_ai_summary_columns():
+    """Add AI summary columns to orders table for enhanced summaries"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            results = []
+            
+            # Add ai_summary_critical column (JSON for critical comment flags)
+            try:
+                cur.execute("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS ai_summary_critical TEXT
+                """)
+                conn.commit()
+                results.append("ai_summary_critical: added")
+            except Exception as e:
+                conn.rollback()
+                results.append(f"ai_summary_critical: {str(e)}")
+            
+            # Add ai_summary_updated_at column
+            try:
+                cur.execute("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS ai_summary_updated_at TIMESTAMP WITH TIME ZONE
+                """)
+                conn.commit()
+                results.append("ai_summary_updated_at: added")
+            except Exception as e:
+                conn.rollback()
+                results.append(f"ai_summary_updated_at: {str(e)}")
+            
+    return {"status": "ok", "results": results}
 
 @app.post("/fix-sku-columns")
 def fix_sku_columns():
@@ -1426,6 +1476,163 @@ def sync_from_gmail(hours_back: int = 2):
         return {"status": "ok", "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gmail sync error: {str(e)}")
+
+# =============================================================================
+# AI SUMMARY REGENERATION
+# =============================================================================
+
+@app.post("/orders/{order_id}/regenerate-summary")
+def regenerate_order_summary(order_id: str):
+    """
+    Regenerate AI summary for a single order.
+    Returns the new summary and any critical comments detected.
+    """
+    if not ai_summary_available:
+        raise HTTPException(status_code=400, detail="AI summary module not available")
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get order
+            cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+            order = cur.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            # Get email snippets
+            cur.execute("""
+                SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
+                FROM order_email_snippets 
+                WHERE order_id = %s 
+                ORDER BY email_date DESC
+                LIMIT 20
+            """, (order_id,))
+            snippets = cur.fetchall()
+            
+            # Get events
+            cur.execute("""
+                SELECT event_type, event_data, created_at 
+                FROM order_events 
+                WHERE order_id = %s 
+                ORDER BY created_at DESC
+                LIMIT 10
+            """, (order_id,))
+            events = cur.fetchall()
+            
+            # Generate new summary
+            summary, critical_comments = generate_summary(dict(order), list(snippets), list(events))
+            
+            # Save to database
+            critical_json = json.dumps(critical_comments) if critical_comments else None
+            cur.execute("""
+                UPDATE orders 
+                SET ai_summary = %s, 
+                    ai_summary_critical = %s,
+                    ai_summary_updated_at = NOW(),
+                    updated_at = NOW()
+                WHERE order_id = %s
+            """, (summary, critical_json, order_id))
+            
+            # Log event
+            cur.execute("""
+                INSERT INTO order_events (order_id, event_type, event_data, source)
+                VALUES (%s, 'ai_summary_regenerated', %s, 'manual')
+            """, (order_id, json.dumps({'has_critical': len(critical_comments) > 0})))
+            
+            conn.commit()
+    
+    return {
+        "status": "ok",
+        "order_id": order_id,
+        "summary": summary,
+        "critical_comments": critical_comments,
+        "has_critical": len(critical_comments) > 0
+    }
+
+@app.post("/orders/regenerate-summaries")
+def regenerate_all_summaries(include_archived: bool = False):
+    """
+    Regenerate AI summaries for all active orders.
+    Use for initial setup or catch-up after changes.
+    Default: excludes archived orders.
+    """
+    if not ai_summary_available:
+        raise HTTPException(status_code=400, detail="AI summary module not available")
+    
+    results = {
+        "total": 0,
+        "success": 0,
+        "errors": [],
+        "critical_orders": []
+    }
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get all non-archived orders (or all if include_archived)
+            if include_archived:
+                cur.execute("SELECT order_id FROM orders ORDER BY order_date DESC")
+            else:
+                cur.execute("""
+                    SELECT order_id FROM orders 
+                    WHERE is_complete = FALSE OR is_complete IS NULL
+                    ORDER BY order_date DESC
+                """)
+            
+            orders = cur.fetchall()
+            results["total"] = len(orders)
+            
+            for order_row in orders:
+                order_id = order_row['order_id']
+                try:
+                    # Get full order data
+                    cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+                    order = cur.fetchone()
+                    
+                    # Get snippets
+                    cur.execute("""
+                        SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
+                        FROM order_email_snippets 
+                        WHERE order_id = %s 
+                        ORDER BY email_date DESC LIMIT 20
+                    """, (order_id,))
+                    snippets = cur.fetchall()
+                    
+                    # Get events
+                    cur.execute("""
+                        SELECT event_type, event_data, created_at 
+                        FROM order_events 
+                        WHERE order_id = %s 
+                        ORDER BY created_at DESC LIMIT 10
+                    """, (order_id,))
+                    events = cur.fetchall()
+                    
+                    # Generate summary
+                    summary, critical_comments = generate_summary(dict(order), list(snippets), list(events))
+                    
+                    # Save
+                    critical_json = json.dumps(critical_comments) if critical_comments else None
+                    cur.execute("""
+                        UPDATE orders 
+                        SET ai_summary = %s,
+                            ai_summary_critical = %s,
+                            ai_summary_updated_at = NOW(),
+                            updated_at = NOW()
+                        WHERE order_id = %s
+                    """, (summary, critical_json, order_id))
+                    
+                    results["success"] += 1
+                    
+                    if critical_comments:
+                        results["critical_orders"].append({
+                            "order_id": order_id,
+                            "flags": [c['type'] for c in critical_comments]
+                        })
+                    
+                except Exception as e:
+                    results["errors"].append({"order_id": order_id, "error": str(e)})
+            
+            conn.commit()
+    
+    return {"status": "ok", "results": results}
 
 @app.get("/b2bwave/order/{order_id}")
 def get_b2bwave_order(order_id: str):
