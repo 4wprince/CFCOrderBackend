@@ -1497,11 +1497,16 @@ def send_tracking_via_b2bwave(order_id: str, tracking_number: str, shipment_id: 
     
     try:
         # Call B2BWave API to set tracking and notify customer
-        url = f"{B2BWAVE_URL}/api/orders/{order_id}/set_shipping_tracking"
+        # Note: B2BWave expects notify as string "true", not boolean
+        # Adding .json extension as B2BWave API may require it
+        url = f"{B2BWAVE_URL}/api/orders/{order_id}/set_shipping_tracking.json"
+        
+        print(f"[B2BWAVE] Sending tracking to: {url}")
+        print(f"[B2BWAVE] Order: {order_id}, Tracking: {tracking_number}")
         
         request_body = json.dumps({
             "shipping_tracking": tracking_number,
-            "notify": True  # This sends the email to customer
+            "notify": "true"  # String "true" sends the email to customer
         }).encode()
         
         credentials = base64.b64encode(f"{B2BWAVE_USERNAME}:{B2BWAVE_API_KEY}".encode()).decode()
