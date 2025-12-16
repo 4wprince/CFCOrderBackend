@@ -10,6 +10,7 @@ import json
 import base64
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 # Gmail API Config - loaded from environment
@@ -17,17 +18,26 @@ GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "").strip()
 GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "").strip()
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "").strip()
 
+# LI Gmail (cfcinvoices42@gmail.com) - for reading LI invoices
+GMAIL_LI_REFRESH_TOKEN = os.environ.get("GMAIL_LI_REFRESH_TOKEN", "").strip()
+
 # Email sender patterns
 SQUARE_PAYMENT_SENDER = "noreply@messaging.squareup.com"
 RL_CARRIERS_SENDER = "rlloads@rlcarriers.com"
 
-# Cache access token
+# Cache access tokens
 _access_token = None
 _token_expires = None
+_li_access_token = None
+_li_token_expires = None
 
 def gmail_configured():
     """Check if Gmail credentials are configured"""
     return bool(GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN)
+
+def gmail_li_configured():
+    """Check if LI Gmail credentials are configured"""
+    return bool(GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_LI_REFRESH_TOKEN)
 
 def get_gmail_access_token():
     """Get a fresh access token using the refresh token"""
@@ -62,6 +72,37 @@ def get_gmail_access_token():
         print(f"[GMAIL] Token refresh error: {e}")
         return None
 
+def get_li_gmail_access_token():
+    """Get access token for LI Gmail (cfcinvoices42@gmail.com)"""
+    global _li_access_token, _li_token_expires
+    
+    if _li_access_token and _li_token_expires and datetime.now(timezone.utc) < _li_token_expires:
+        return _li_access_token
+    
+    if not gmail_li_configured():
+        print("[GMAIL-LI] Not configured")
+        return None
+    
+    try:
+        token_data = urllib.parse.urlencode({
+            'client_id': GMAIL_CLIENT_ID,
+            'client_secret': GMAIL_CLIENT_SECRET,
+            'refresh_token': GMAIL_LI_REFRESH_TOKEN,
+            'grant_type': 'refresh_token'
+        }).encode()
+        
+        req = urllib.request.Request('https://oauth2.googleapis.com/token', data=token_data)
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode())
+            _li_access_token = data.get('access_token')
+            _li_token_expires = datetime.now(timezone.utc) + timedelta(minutes=50)
+            return _li_access_token
+            
+    except Exception as e:
+        print(f"[GMAIL-LI] Token refresh error: {e}")
+        return None
+
 def gmail_api_request(endpoint, params=None):
     """Make authenticated request to Gmail API"""
     token = get_gmail_access_token()
@@ -85,12 +126,88 @@ def gmail_api_request(endpoint, params=None):
         print(f"[GMAIL] Request error: {e}")
         return None
 
+def li_gmail_api_request(endpoint, params=None):
+    """Make authenticated request to LI Gmail API (cfcinvoices42)"""
+    token = get_li_gmail_access_token()
+    if not token:
+        return None
+    
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/{endpoint}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {token}")
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"[GMAIL-LI] API error {e.code}: {e.read().decode()[:200]}")
+        return None
+    except Exception as e:
+        print(f"[GMAIL-LI] Request error: {e}")
+        return None
+
 def search_emails(query, max_results=50):
     """Search Gmail for messages matching query"""
     data = gmail_api_request("messages", {"q": query, "maxResults": max_results})
     if not data:
         return []
     return data.get("messages", [])
+
+def search_li_emails(query, max_results=50):
+    """Search LI Gmail (cfcinvoices42) for messages"""
+    data = li_gmail_api_request("messages", {"q": query, "maxResults": max_results})
+    if not data:
+        return []
+    return data.get("messages", [])
+
+def get_li_email_content(message_id):
+    """Get email content from LI Gmail"""
+    data = li_gmail_api_request(f"messages/{message_id}", {"format": "full"})
+    if not data:
+        return None
+    
+    headers = {h['name'].lower(): h['value'] for h in data.get('payload', {}).get('headers', [])}
+    
+    body = ""
+    html_body = ""
+    payload = data.get('payload', {})
+    
+    if 'body' in payload and payload['body'].get('data'):
+        body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+    elif 'parts' in payload:
+        for part in payload['parts']:
+            mime_type = part.get('mimeType', '')
+            part_data = part.get('body', {}).get('data')
+            
+            if mime_type == 'text/plain' and part_data:
+                body = base64.urlsafe_b64decode(part_data).decode('utf-8', errors='ignore')
+            elif mime_type == 'text/html' and part_data and not html_body:
+                html_body = base64.urlsafe_b64decode(part_data).decode('utf-8', errors='ignore')
+            
+            if 'parts' in part:
+                for subpart in part['parts']:
+                    sub_mime = subpart.get('mimeType', '')
+                    sub_data = subpart.get('body', {}).get('data')
+                    if sub_mime == 'text/plain' and sub_data:
+                        body = base64.urlsafe_b64decode(sub_data).decode('utf-8', errors='ignore')
+                    elif sub_mime == 'text/html' and sub_data and not html_body:
+                        html_body = base64.urlsafe_b64decode(sub_data).decode('utf-8', errors='ignore')
+    
+    if not body and html_body:
+        body = re.sub(r'<[^>]+>', ' ', html_body)
+        body = re.sub(r'\s+', ' ', body).strip()
+    
+    return {
+        'id': message_id,
+        'subject': headers.get('subject', ''),
+        'from': headers.get('from', ''),
+        'to': headers.get('to', ''),
+        'date': headers.get('date', ''),
+        'body': body
+    }
 
 def get_email_content(message_id):
     """Get email details including subject, from, body"""
@@ -220,6 +337,10 @@ def run_gmail_sync(db_conn, hours_back=2):
                     
             except Exception as e:
                 results["errors"].append(f"Payment link error: {e}")
+                try:
+                    db_conn.rollback()
+                except:
+                    pass
                 
     except Exception as e:
         results["errors"].append(f"Payment link search error: {e}")
@@ -310,58 +431,60 @@ def run_gmail_sync(db_conn, hours_back=2):
                         
             except Exception as e:
                 results["errors"].append(f"Tracking error: {e}")
+                try:
+                    db_conn.rollback()  # Recover from aborted transaction
+                except:
+                    pass
                 
     except Exception as e:
         results["errors"].append(f"Tracking search error: {e}")
     
-    # 5. LI Invoices (Li's invoices = order delivered)
+    # 5. LI Invoices (read directly from cfcinvoices42@gmail.com)
     results["li_invoices"] = 0
-    try:
-        # Search label OR content with proper Gmail syntax
-        messages = search_emails(f'{time_filter} (label:li-invoices OR (from:cfcinvoices42@gmail.com) OR ("Cabinetry Distribution" invoice))')
-        print(f"[GMAIL] Found {len(messages)} potential LI invoice emails")
-        
-        # Allowed senders for LI invoices
-        allowed_senders = ['cabinetry distribution', 'cfcinvoices42', 'cabinetrydistribution', 'square']
-        
-        for msg in messages:
-            try:
-                email = get_email_content(msg['id'])
-                if not email:
-                    print(f"[GMAIL] Could not get content for message {msg['id']}")
-                    continue
-                
-                print(f"[GMAIL] Checking email from: {email['from']}, subject: {email['subject'][:50]}")
-                
-                # Validate sender (soft check)
-                from_text = email['from'].lower()
-                if not any(s in from_text for s in allowed_senders):
-                    print(f"[GMAIL] Skipping - sender not in allowed list: {email['from']}")
-                    continue
-                
-                # Check subject OR body for Cabinetry Distribution (handles Fwd: and variations)
-                subject_and_body = (email['subject'] + " " + email['body']).lower()
-                if 'cabinetry distribution' not in subject_and_body:
-                    print(f"[GMAIL] Skipping - 'cabinetry distribution' not found in subject/body")
-                    continue
-                
-                # Robust PO extraction - handles: Po 5305, PO: 5305, PO#5305, P.O. 5305 (4-6 digits)
-                po_match = re.search(r'\bP\.?O\.?\s*[:#]?\s*(\d{4,6})\b', subject_and_body, re.IGNORECASE)
-                if po_match:
-                    order_id = po_match.group(1)
-                    print(f"[GMAIL] LI Invoice for order {order_id}")
-                    update_li_shipment_delivered(db_conn, order_id, email)
-                    results["li_invoices"] += 1
-                else:
-                    print(f"[GMAIL] No PO number found in email")
+    
+    if not gmail_li_configured():
+        print("[GMAIL-LI] LI Gmail not configured, skipping LI invoice sync")
+    else:
+        try:
+            # Search cfcinvoices42@gmail.com for LI invoices
+            messages = search_li_emails(f'{time_filter} subject:"Cabinetry Distribution"')
+            print(f"[GMAIL-LI] Found {len(messages)} LI invoice emails in cfcinvoices42")
+            
+            for msg in messages:
+                try:
+                    email = get_li_email_content(msg['id'])
+                    if not email:
+                        print(f"[GMAIL-LI] Could not get content for message {msg['id']}")
+                        continue
                     
-            except Exception as e:
-                results["errors"].append(f"LI invoice error: {e}")
-                print(f"[GMAIL] LI invoice error: {e}")
-                
-    except Exception as e:
-        results["errors"].append(f"LI invoice search error: {e}")
-        print(f"[GMAIL] LI invoice search error: {e}")
+                    print(f"[GMAIL-LI] Checking: {email['subject'][:60]}")
+                    
+                    # Must be an invoice from Cabinetry Distribution
+                    subject_and_body = (email['subject'] + " " + email['body']).lower()
+                    if 'cabinetry distribution' not in subject_and_body:
+                        continue
+                    
+                    # Robust PO extraction - handles: Po 5305, PO: 5305, PO#5305, P.O. 5305
+                    po_match = re.search(r'\bP\.?O\.?\s*[:#]?\s*(\d{4,6})\b', subject_and_body, re.IGNORECASE)
+                    if po_match:
+                        order_id = po_match.group(1)
+                        print(f"[GMAIL-LI] LI Invoice for order {order_id}")
+                        update_li_shipment_delivered(db_conn, order_id, email)
+                        results["li_invoices"] += 1
+                    else:
+                        print(f"[GMAIL-LI] No PO number found in email")
+                        
+                except Exception as e:
+                    results["errors"].append(f"LI invoice error: {e}")
+                    print(f"[GMAIL-LI] LI invoice error: {e}")
+                    try:
+                        db_conn.rollback()
+                    except:
+                        pass
+                    
+        except Exception as e:
+            results["errors"].append(f"LI invoice search error: {e}")
+            print(f"[GMAIL-LI] LI invoice search error: {e}")
     
     print(f"[GMAIL] Sync complete: {results}")
     return results
