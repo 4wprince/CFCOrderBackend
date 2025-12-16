@@ -58,14 +58,11 @@ WAREHOUSE_EMAILS = {
     # Dealer Cabinetry
     "orders@dealercabinetry.com": "Dealer Cabinetry",
     
-    # Cabinets Distribution
-    "cabinetrydistribution@gmail.com": "Cabinetry Distribution",
+    # LI (forwarder/delivery)
+    "cabinetrydistribution@gmail.com": "LI",
     
     # LNC Cabinetry
     "lnccabinetryvab@gmail.com": "LNC",
-    
-    # LI (forwarder/delivery)
-    "li@example.com": "LI",  # Update with actual LI email
 }
 
 # Domains to match warehouse emails (for incoming detection)
