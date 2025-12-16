@@ -1711,6 +1711,20 @@ def list_square_payments(hours_back: int = 48):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/square/debug-order/{square_order_id}")
+def debug_square_order(square_order_id: str):
+    """Debug: Fetch raw Square order to see where payment link name is stored"""
+    if not square_configured():
+        raise HTTPException(status_code=400, detail="Square API not configured")
+    
+    try:
+        from square_sync import square_api_request
+        result = square_api_request(f"orders/{square_order_id}")
+        return {"status": "ok", "raw_order": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 # =============================================================================
 # TRACKING EMAIL (via Gmail)
 # =============================================================================
