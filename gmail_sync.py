@@ -345,6 +345,12 @@ def run_gmail_sync(db_conn, hours_back=2):
     except Exception as e:
         results["errors"].append(f"Payment link search error: {e}")
     
+    # Clean transaction state
+    try:
+        db_conn.rollback()
+    except:
+        pass
+    
     # 2. Payments Received (Square notifications)
     try:
         messages = search_emails(f'{time_filter} from:{SQUARE_PAYMENT_SENDER} subject:"payment received"')
@@ -369,6 +375,12 @@ def run_gmail_sync(db_conn, hours_back=2):
                 
     except Exception as e:
         results["errors"].append(f"Payment search error: {e}")
+    
+    # Clean transaction state
+    try:
+        db_conn.rollback()
+    except:
+        pass
     
     # 3. RL Quote Numbers
     try:
@@ -396,6 +408,12 @@ def run_gmail_sync(db_conn, hours_back=2):
                 
     except Exception as e:
         results["errors"].append(f"RL quote search error: {e}")
+    
+    # Clean transaction state before tracking
+    try:
+        db_conn.rollback()
+    except:
+        pass
     
     # 4. Tracking Numbers / PRO Numbers
     try:
@@ -438,6 +456,12 @@ def run_gmail_sync(db_conn, hours_back=2):
                 
     except Exception as e:
         results["errors"].append(f"Tracking search error: {e}")
+    
+    # Ensure clean transaction state before LI invoices
+    try:
+        db_conn.rollback()
+    except:
+        pass
     
     # 5. LI Invoices (read directly from cfcinvoices42@gmail.com)
     results["li_invoices"] = 0
