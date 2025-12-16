@@ -297,14 +297,12 @@ def run_gmail_sync(db_conn, hours_back=2):
     # 5. LI Invoices (Li's invoices = order delivered)
     results["li_invoices"] = 0
     try:
-        # Search for invoices - label is lowercase in Gmail search
-        messages = search_emails(f'{time_filter} label:li-invoices')
-        print(f"[GMAIL] Found {len(messages)} emails in li-invoices label")
+        # Search label OR content - not label-only (handles unlabeled invoices)
+        messages = search_emails(f'{time_filter} (label:li-invoices OR "Cabinetry Distribution" invoice)')
+        print(f"[GMAIL] Found {len(messages)} potential LI invoice emails")
         
-        # If no results with label, try searching by content
-        if not messages:
-            messages = search_emails(f'{time_filter} subject:"Cabinetry Distribution" invoice')
-            print(f"[GMAIL] Found {len(messages)} emails matching Cabinetry Distribution invoice")
+        # Allowed senders for LI invoices
+        allowed_senders = ['cabinetry distribution', 'cfcinvoices42@gmail.com', 'cabinetrydistribution@gmail.com']
         
         for msg in messages:
             try:
@@ -312,12 +310,18 @@ def run_gmail_sync(db_conn, hours_back=2):
                 if not email:
                     continue
                 
-                # Verify it's an LI invoice (subject contains Cabinetry Distribution)
-                if 'cabinetry distribution' not in email['subject'].lower():
+                # Validate sender (soft check)
+                from_text = email['from'].lower()
+                if not any(s in from_text for s in allowed_senders):
                     continue
                 
-                # Extract PO number from body (format: "Po    5305")
-                po_match = re.search(r'Po\s+(\d{4,5})', email['body'])
+                # Check subject OR body for Cabinetry Distribution (handles Fwd: and variations)
+                subject_and_body = (email['subject'] + " " + email['body']).lower()
+                if 'cabinetry distribution' not in subject_and_body:
+                    continue
+                
+                # Robust PO extraction - handles: Po 5305, PO: 5305, PO#5305, P.O. 5305
+                po_match = re.search(r'\bP\.?O\.?\s*[:#]?\s*(\d{4,5})\b', subject_and_body, re.IGNORECASE)
                 if po_match:
                     order_id = po_match.group(1)
                     print(f"[GMAIL] LI Invoice for order {order_id}")
