@@ -1627,6 +1627,19 @@ def sync_from_gmail(hours_back: int = 2):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gmail sync error: {str(e)}")
 
+@app.get("/gmail/sync-now")
+def sync_gmail_now(hours_back: int = 2):
+    """GET endpoint for easy browser testing of Gmail sync"""
+    if not gmail_configured():
+        raise HTTPException(status_code=400, detail="Gmail not configured")
+    
+    try:
+        with get_db() as conn:
+            results = run_gmail_sync(conn, hours_back=hours_back)
+        return {"status": "ok", "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gmail sync error: {str(e)}")
+
 # =============================================================================
 # TRACKING EMAIL (via Gmail)
 # =============================================================================
@@ -1815,6 +1828,77 @@ def regenerate_order_summary(order_id: str):
         "critical_comments": critical_comments,
         "has_critical": len(critical_comments) > 0
     }
+
+@app.post("/orders/regenerate-summaries")
+def regenerate_all_summaries():
+    """
+    Regenerate AI summaries for all active (non-complete) orders.
+    """
+    if not ai_summary_available:
+        raise HTTPException(status_code=400, detail="AI summary module not available")
+    
+    results = {"regenerated": 0, "errors": []}
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get all active orders
+            cur.execute("""
+                SELECT order_id FROM orders 
+                WHERE is_complete = false 
+                ORDER BY order_date DESC
+            """)
+            orders = cur.fetchall()
+            
+            for order_row in orders:
+                order_id = order_row['order_id']
+                try:
+                    # Get order details
+                    cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+                    order = cur.fetchone()
+                    
+                    # Get email snippets
+                    cur.execute("""
+                        SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
+                        FROM order_email_snippets 
+                        WHERE order_id = %s 
+                        ORDER BY email_date DESC
+                        LIMIT 20
+                    """, (order_id,))
+                    snippets = cur.fetchall()
+                    
+                    # Get events
+                    cur.execute("""
+                        SELECT event_type, event_data, created_at 
+                        FROM order_events 
+                        WHERE order_id = %s 
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                    """, (order_id,))
+                    events = cur.fetchall()
+                    
+                    # Generate new summary
+                    summary, critical_comments = generate_summary(dict(order), list(snippets), list(events))
+                    
+                    # Save to database
+                    critical_json = json.dumps(critical_comments) if critical_comments else None
+                    cur.execute("""
+                        UPDATE orders 
+                        SET ai_summary = %s, 
+                            ai_summary_critical = %s,
+                            ai_summary_updated_at = NOW(),
+                            updated_at = NOW()
+                        WHERE order_id = %s
+                    """, (summary, critical_json, order_id))
+                    
+                    conn.commit()
+                    results["regenerated"] += 1
+                    print(f"[AI] Regenerated summary for order {order_id}")
+                    
+                except Exception as e:
+                    results["errors"].append(f"Order {order_id}: {str(e)}")
+                    print(f"[AI] Error regenerating summary for {order_id}: {e}")
+    
+    return {"status": "ok", "results": results}
 
 @app.post("/orders/{order_id}/comprehensive-summary")
 def generate_comprehensive_summary(order_id: str):
