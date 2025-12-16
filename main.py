@@ -1829,77 +1829,6 @@ def regenerate_order_summary(order_id: str):
         "has_critical": len(critical_comments) > 0
     }
 
-@app.post("/orders/regenerate-summaries")
-def regenerate_all_summaries():
-    """
-    Regenerate AI summaries for all active (non-complete) orders.
-    """
-    if not ai_summary_available:
-        raise HTTPException(status_code=400, detail="AI summary module not available")
-    
-    results = {"regenerated": 0, "errors": []}
-    
-    with get_db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get all active orders
-            cur.execute("""
-                SELECT order_id FROM orders 
-                WHERE is_complete = false 
-                ORDER BY order_date DESC
-            """)
-            orders = cur.fetchall()
-            
-            for order_row in orders:
-                order_id = order_row['order_id']
-                try:
-                    # Get order details
-                    cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
-                    order = cur.fetchone()
-                    
-                    # Get email snippets
-                    cur.execute("""
-                        SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
-                        FROM order_email_snippets 
-                        WHERE order_id = %s 
-                        ORDER BY email_date DESC
-                        LIMIT 20
-                    """, (order_id,))
-                    snippets = cur.fetchall()
-                    
-                    # Get events
-                    cur.execute("""
-                        SELECT event_type, event_data, created_at 
-                        FROM order_events 
-                        WHERE order_id = %s 
-                        ORDER BY created_at DESC
-                        LIMIT 10
-                    """, (order_id,))
-                    events = cur.fetchall()
-                    
-                    # Generate new summary
-                    summary, critical_comments = generate_summary(dict(order), list(snippets), list(events))
-                    
-                    # Save to database
-                    critical_json = json.dumps(critical_comments) if critical_comments else None
-                    cur.execute("""
-                        UPDATE orders 
-                        SET ai_summary = %s, 
-                            ai_summary_critical = %s,
-                            ai_summary_updated_at = NOW(),
-                            updated_at = NOW()
-                        WHERE order_id = %s
-                    """, (summary, critical_json, order_id))
-                    
-                    conn.commit()
-                    results["regenerated"] += 1
-                    print(f"[AI] Regenerated summary for order {order_id}")
-                    
-                except Exception as e:
-                    results["errors"].append(f"Order {order_id}: {str(e)}")
-                    print(f"[AI] Error regenerating summary for {order_id}: {e}")
-    
-    return {"status": "ok", "results": results}
-
 @app.post("/orders/{order_id}/comprehensive-summary")
 def generate_comprehensive_summary(order_id: str):
     """
@@ -2446,6 +2375,79 @@ def list_orders(
                 order['shipments'] = shipments_by_order.get(order['order_id'], [])
             
             return {"status": "ok", "count": len(orders), "orders": orders}
+
+@app.api_route("/orders/regenerate-summaries", methods=["GET", "POST"])
+def regenerate_all_summaries():
+    """
+    Regenerate AI summaries for active orders that don't have one yet.
+    """
+    if not ai_summary_available:
+        raise HTTPException(status_code=400, detail="AI summary module not available")
+    
+    results = {"regenerated": 0, "skipped": 0, "errors": []}
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get active orders WITHOUT summaries
+            cur.execute("""
+                SELECT order_id FROM orders 
+                WHERE is_complete = false 
+                  AND (ai_summary IS NULL OR ai_summary = '')
+                ORDER BY order_date DESC
+                LIMIT 20
+            """)
+            orders = cur.fetchall()
+            
+            print(f"[AI] Found {len(orders)} orders needing summaries")
+            
+            for order_row in orders:
+                oid = order_row['order_id']
+                try:
+                    cur.execute("SELECT * FROM orders WHERE order_id = %s", (oid,))
+                    order = cur.fetchone()
+                    
+                    cur.execute("""
+                        SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
+                        FROM order_email_snippets 
+                        WHERE order_id = %s 
+                        ORDER BY email_date DESC
+                        LIMIT 20
+                    """, (oid,))
+                    snippets = cur.fetchall()
+                    
+                    cur.execute("""
+                        SELECT event_type, event_data, created_at 
+                        FROM order_events 
+                        WHERE order_id = %s 
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                    """, (oid,))
+                    events = cur.fetchall()
+                    
+                    summary, critical_comments = generate_summary(dict(order), list(snippets), list(events))
+                    
+                    critical_json = json.dumps(critical_comments) if critical_comments else None
+                    cur.execute("""
+                        UPDATE orders 
+                        SET ai_summary = %s, 
+                            ai_summary_critical = %s,
+                            ai_summary_updated_at = NOW(),
+                            updated_at = NOW()
+                        WHERE order_id = %s
+                    """, (summary, critical_json, oid))
+                    
+                    conn.commit()
+                    results["regenerated"] += 1
+                    print(f"[AI] Regenerated summary for order {oid}")
+                    
+                except Exception as e:
+                    results["errors"].append(f"Order {oid}: {str(e)}")
+                    try:
+                        conn.rollback()
+                    except:
+                        pass
+    
+    return {"status": "ok", "results": results}
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
