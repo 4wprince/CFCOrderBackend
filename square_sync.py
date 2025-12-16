@@ -52,6 +52,7 @@ def extract_order_ids(description: str) -> List[str]:
     Extract order IDs from Square payment description.
     
     Examples:
+    - "5299-Creative Spaces" -> ["5299"]
     - "5317 & 5319 G&B CFC" -> ["5317", "5319"]
     - "5184 Broke and Poor CFC" -> ["5184"]
     - "Order #5299 Smith" -> ["5299"]
@@ -62,18 +63,17 @@ def extract_order_ids(description: str) -> List[str]:
     
     order_ids = []
     
-    # Pattern 1: Numbers at the start or after common separators
-    # Match 4-5 digit numbers that look like order IDs
-    # Look for patterns like "5317 & 5319" or "5317, 5319" or just "5317"
+    # Pattern 1: Number at start followed by hyphen (e.g., "5299-Creative Spaces")
+    start_match = re.match(r'^(\d{4,5})', description)
+    if start_match:
+        order_ids.append(start_match.group(1))
     
-    # First, try to find all 4-5 digit numbers in the text
-    # But be smart about it - order IDs are typically 4-5 digits starting with 5
+    # Pattern 2: Find all 4-5 digit numbers starting with 5 (typical CFC order IDs)
     matches = re.findall(r'\b(5\d{3,4})\b', description)
+    order_ids.extend(matches)
     
-    if matches:
-        order_ids.extend(matches)
-    else:
-        # Fallback: try any 4-5 digit number
+    # Pattern 3: Fallback - any 4-5 digit number
+    if not order_ids:
         matches = re.findall(r'\b(\d{4,5})\b', description)
         order_ids.extend(matches)
     
@@ -127,8 +127,8 @@ def parse_payment_for_matching(payment: dict) -> dict:
     Parse a Square payment object into a format for order matching.
     
     The payment link name (like "5317 & 5319 G&B CFC") is stored in:
-    1. The payment's "note" field (if set via API)
-    2. The linked Order's line_items[0].name (when created via Dashboard)
+    1. The linked Order's line_items[0].name (when created via Dashboard)
+    2. The payment's "note" field (if set via API)
     
     Returns dict with:
     - payment_id: Square payment ID
@@ -142,30 +142,22 @@ def parse_payment_for_matching(payment: dict) -> dict:
     amount_cents = amount_money.get("amount", 0)
     amount_dollars = amount_cents / 100.0
     
-    # Try to get description from multiple sources
     description = ""
-    
-    # Source 1: Payment note field
-    if payment.get("note"):
-        description = payment.get("note")
-    
-    # Source 2: Receipt number (fallback)
-    if not description and payment.get("receipt_number"):
-        description = payment.get("receipt_number")
-    
-    # Source 3: Fetch the linked Square Order to get line item name
-    # This is where Dashboard-created payment link names are stored
     square_order_id = payment.get("order_id")
-    if not description and square_order_id:
+    
+    # PRIMARY SOURCE: Fetch the linked Square Order to get line item name
+    # This is where Dashboard-created payment link names are stored (e.g., "5299-Creative Spaces")
+    if square_order_id:
         order = get_square_order(square_order_id)
         if order:
-            # Get name from first line item
+            # Get name from first line item - this has the payment link name
             line_items = order.get("line_items", [])
             if line_items:
                 description = line_items[0].get("name", "")
-            # Also check order-level note
-            if not description:
-                description = order.get("note", "")
+    
+    # FALLBACK: Check payment note field
+    if not description and payment.get("note"):
+        description = payment.get("note")
     
     # Extract customer info if available
     customer_name = None
