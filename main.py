@@ -1781,7 +1781,155 @@ def regenerate_order_summary(order_id: str):
         "has_critical": len(critical_comments) > 0
     }
 
-@app.post("/orders/regenerate-summaries")
+@app.post("/orders/{order_id}/comprehensive-summary")
+def generate_comprehensive_summary(order_id: str):
+    """
+    Generate a detailed comprehensive AI summary for the order popout.
+    Up to 15 bullet points with full order analysis.
+    This is generated on-demand, not stored.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=400, detail="Anthropic API not configured")
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get order
+            cur.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+            order = cur.fetchone()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            # Get ALL email snippets (not just recent)
+            cur.execute("""
+                SELECT email_from, email_subject, email_snippet, email_date, snippet_type 
+                FROM order_email_snippets 
+                WHERE order_id = %s 
+                ORDER BY email_date DESC
+                LIMIT 50
+            """, (order_id,))
+            snippets = cur.fetchall()
+            
+            # Get ALL events
+            cur.execute("""
+                SELECT event_type, event_data, created_at 
+                FROM order_events 
+                WHERE order_id = %s 
+                ORDER BY created_at DESC
+                LIMIT 50
+            """, (order_id,))
+            events = cur.fetchall()
+            
+            # Get shipments
+            cur.execute("""
+                SELECT warehouse, ship_method, status, tracking_number, 
+                       shipping_cost, shipped_at, carrier_quote
+                FROM order_shipments 
+                WHERE order_id = %s
+            """, (order_id,))
+            shipments = cur.fetchall()
+    
+    # Build comprehensive context
+    context_parts = []
+    
+    # Full order info
+    context_parts.append(f"=== ORDER #{order_id} COMPREHENSIVE ANALYSIS ===")
+    context_parts.append(f"Customer: {order.get('company_name') or order.get('customer_name')}")
+    context_parts.append(f"Email: {order.get('email')}")
+    context_parts.append(f"Phone: {order.get('phone')}")
+    context_parts.append(f"Order Total: ${order.get('order_total', 0)}")
+    context_parts.append(f"Order Date: {order.get('order_date')}")
+    context_parts.append(f"Days Open: {order.get('days_open', 0)}")
+    context_parts.append(f"Current Status: {order.get('status')}")
+    
+    # Payment info
+    context_parts.append(f"\n=== PAYMENT STATUS ===")
+    context_parts.append(f"Payment Link Sent: {'Yes' if order.get('payment_link_sent') else 'No'}")
+    context_parts.append(f"Payment Received: {'Yes' if order.get('payment_received') else 'No'}")
+    if order.get('payment_link'):
+        context_parts.append(f"Payment Link: {order.get('payment_link')}")
+    
+    # Shipping info
+    if order.get('tracking'):
+        context_parts.append(f"Main Tracking: {order.get('tracking')}")
+    if order.get('pro_number'):
+        context_parts.append(f"PRO Number: {order.get('pro_number')}")
+    
+    # Customer comments
+    if order.get('comments'):
+        context_parts.append(f"\n=== CUSTOMER COMMENTS ===")
+        context_parts.append(order.get('comments'))
+    
+    # Internal notes
+    if order.get('notes'):
+        context_parts.append(f"\n=== INTERNAL NOTES ===")
+        context_parts.append(order.get('notes'))
+    
+    # Shipments detail
+    if shipments:
+        context_parts.append(f"\n=== SHIPMENTS ({len(shipments)} warehouses) ===")
+        for s in shipments:
+            ship_info = f"- {s.get('warehouse')}: {s.get('status', 'unknown')} via {s.get('ship_method', 'TBD')}"
+            if s.get('tracking_number'):
+                ship_info += f" (Tracking: {s.get('tracking_number')})"
+            if s.get('shipping_cost'):
+                ship_info += f" (${s.get('shipping_cost')})"
+            context_parts.append(ship_info)
+    
+    # Email history
+    if snippets:
+        context_parts.append(f"\n=== EMAIL COMMUNICATIONS ({len(snippets)} emails) ===")
+        for s in snippets:
+            date_str = s['email_date'].strftime('%m/%d/%Y') if s.get('email_date') else ''
+            context_parts.append(f"- [{date_str}] From: {s.get('email_from', 'Unknown')}")
+            context_parts.append(f"  Subject: {s.get('email_subject', '')}")
+            if s.get('email_snippet'):
+                context_parts.append(f"  {s['email_snippet'][:500]}")
+    
+    # Event history
+    if events:
+        important_events = [e for e in events if e.get('event_type') not in ('b2bwave_sync', 'auto_sync', 'status_check')]
+        if important_events:
+            context_parts.append(f"\n=== ORDER EVENTS ({len(important_events)} events) ===")
+            for e in important_events[:20]:  # Limit to 20 most recent
+                date_str = e['created_at'].strftime('%m/%d %H:%M') if e.get('created_at') else ''
+                event_data = e.get('event_data', {})
+                if isinstance(event_data, str):
+                    try:
+                        event_data = json.loads(event_data)
+                    except:
+                        event_data = {}
+                context_parts.append(f"- [{date_str}] {e.get('event_type')}: {json.dumps(event_data) if event_data else ''}")
+    
+    context = "\n".join(context_parts)
+    
+    # Comprehensive summary prompt
+    prompt = f"""Analyze this order and provide a comprehensive summary with up to 15 bullet points.
+
+RULES:
+- Use bullet points (• symbol)
+- NO headers, NO bold text, NO markdown
+- Be thorough but concise - include ALL relevant details
+- Include timeline of key events if applicable
+- Note any issues, special requests, or concerns
+- Include payment status and what's pending
+- Include shipping status for each warehouse
+- Note any communication patterns or customer behavior
+- Flag anything unusual or requiring attention
+- End with clear "Next Actions:" section listing 1-3 specific things to do
+
+TONE: Professional but conversational, like briefing a colleague
+
+{context}"""
+
+    try:
+        summary = call_anthropic_api(prompt)
+        return {
+            "status": "ok",
+            "order_id": order_id,
+            "comprehensive_summary": summary
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI summary generation failed: {str(e)}")
 def regenerate_all_summaries(include_archived: bool = False):
     """
     Regenerate AI summaries for all active orders.
