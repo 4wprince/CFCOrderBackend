@@ -690,8 +690,8 @@ def run_gmail_sync(db_conn, hours_back=2):
     # 8. Shipped indicators (various patterns that indicate order shipped)
     results["shipped_detected"] = 0
     try:
-        # Search for shipping confirmation patterns
-        messages = search_emails(f'{time_filter} ("has tracking" OR "UPS tracking" OR "UPS label" OR "ready for pick" OR "pickup code" OR "Shipping & Handling")')
+        # Expanded search for shipping confirmation patterns
+        messages = search_emails(f'{time_filter} ("has tracking" OR "tracking #" OR "UPS tracking" OR "UPS label" OR "attaching" OR "ready for pick" OR "pickup" OR "pick up" OR "ready whenever" OR "on the way" OR "ship out today" OR "will ship" OR "shipped out" OR "Shipping Cost" OR "FedEx" OR "SAIA" OR "PRO #" OR "This is approved")')
         print(f"[GMAIL] Found {len(messages)} potential shipped indicator emails")
         
         for msg in messages:
@@ -701,7 +701,8 @@ def run_gmail_sync(db_conn, hours_back=2):
                     continue
                 
                 text = (email['subject'] + ' ' + email['body']).lower()
-                order_id = extract_order_id(email['subject'] + ' ' + email['body'])
+                text_original = email['subject'] + ' ' + email['body']
+                order_id = extract_order_id(text_original)
                 
                 if not order_id:
                     continue
@@ -709,36 +710,65 @@ def run_gmail_sync(db_conn, hours_back=2):
                 tracking_info = None
                 source = None
                 
-                # Check various shipped patterns
-                if 'has tracking' in text or 'tracking' in email['subject'].lower():
-                    # Look for tracking number in body
-                    tracking_match = re.search(r'(?:tracking|SAIA)\s+(\d{10,12})', email['body'], re.IGNORECASE)
+                # Check various shipped patterns (order matters - more specific first)
+                
+                # FedEx tracking
+                fedex_match = re.search(r'(?:fedex|FedEx)[^\d]*(\d{12,15})', text_original, re.IGNORECASE)
+                if fedex_match or ('fedex' in text and 'tracking' in text):
+                    if fedex_match:
+                        tracking_info = f"FedEx {fedex_match.group(1)}"
+                    source = 'fedex_tracking'
+                
+                # SAIA tracking (12 digits)
+                elif re.search(r'saia.*pro\s*#?\s*(\d{12})', text, re.IGNORECASE):
+                    saia_match = re.search(r'saia.*pro\s*#?\s*(\d{12})', text, re.IGNORECASE)
+                    tracking_info = f"SAIA PRO {saia_match.group(1)}"
+                    source = 'saia_tracking'
+                
+                # UPS tracking (1Z...)
+                elif 'ups' in text:
+                    ups_match = re.search(r'(1Z[A-Z0-9]{16})', text_original)
+                    if ups_match:
+                        tracking_info = f"UPS {ups_match.group(1)}"
+                    source = 'ups_tracking'
+                
+                # "attaching" + label/UPS (Connie's common pattern)
+                elif 'attaching' in text and ('label' in text or 'ups' in text):
+                    source = 'label_attached'
+                
+                # "This is approved" + attaching
+                elif 'this is approved' in text and 'attach' in text:
+                    source = 'approved_with_label'
+                
+                # Pick up ready variations
+                elif any(phrase in text for phrase in ['ready for pick', 'pick up', 'pickup', 'ready whenever you are']):
+                    source = 'ready_for_pickup'
+                
+                # Ship out today / will ship
+                elif any(phrase in text for phrase in ['ship out today', 'will ship today', 'shipped out', 'this will ship']):
+                    source = 'ship_confirmation'
+                
+                # "on the way via" carrier
+                elif 'on the way' in text:
+                    source = 'on_the_way'
+                
+                # Shipping Cost $ (DL Cabinetry pattern)
+                elif 'shipping cost' in text:
+                    ship_match = re.search(r'shipping\s*cost\s*\$?([\d,.]+)', text, re.IGNORECASE)
+                    if ship_match:
+                        source = 'shipping_cost_confirmed'
+                
+                # Generic tracking mention with number
+                elif 'tracking' in text:
+                    tracking_match = re.search(r'tracking\s*#?\s*:?\s*(\d{10,20})', text_original, re.IGNORECASE)
                     if tracking_match:
                         tracking_info = tracking_match.group(1)
-                    source = 'has_tracking_email'
-                    
-                elif 'ups tracking' in text or 'ups label' in text:
-                    # UPS tracking
-                    ups_match = re.search(r'(1Z[A-Z0-9]{16})', email['body'])
-                    if ups_match:
-                        tracking_info = ups_match.group(1)
-                    source = 'ups_tracking_email'
-                    
-                elif 'ready for pick' in text or 'pickup code' in text:
-                    source = 'ready_for_pickup'
-                    
-                elif 'shipping & handling' in text:
-                    # DL Cabinetry pattern
-                    ship_match = re.search(r'shipping\s*&\s*handling\s*\$?([\d.]+)', text, re.IGNORECASE)
-                    if ship_match:
-                        source = 'dl_shipping_confirmation'
-                
-                elif 'please see' in text and 'attach' in text:
-                    source = 'attachment_shipped'
+                    source = 'tracking_number'
                 
                 if source:
                     update_shipment_shipped(db_conn, order_id, None, tracking_info, source, email)
                     results["shipped_detected"] += 1
+                    print(f"[GMAIL] Shipped: Order {order_id} - {source}")
                     
             except Exception as e:
                 results["errors"].append(f"Shipped detection error: {e}")
@@ -823,6 +853,57 @@ def run_gmail_sync(db_conn, hours_back=2):
                 
     except Exception as e:
         results["errors"].append(f"Reactivation search error: {e}")
+    
+    # Clean transaction state
+    try:
+        db_conn.rollback()
+    except:
+        pass
+    
+    # 11. Critical issue detection (out of stock, backorder, inventory issues)
+    results["issues_flagged"] = 0
+    try:
+        messages = search_emails(f'{time_filter} ("out of stock" OR "backorder" OR "back order" OR "inventory issue" OR "stock issue" OR "not available" OR "discontinued")')
+        print(f"[GMAIL] Found {len(messages)} potential issue emails")
+        
+        for msg in messages:
+            try:
+                email = get_email_content(msg['id'])
+                if not email:
+                    continue
+                
+                text = (email['subject'] + ' ' + email['body']).lower()
+                order_id = extract_order_id(email['subject'] + ' ' + email['body'])
+                
+                if not order_id:
+                    continue
+                
+                issue_type = None
+                if 'out of stock' in text:
+                    issue_type = 'out_of_stock'
+                elif 'backorder' in text or 'back order' in text:
+                    issue_type = 'backorder'
+                elif 'inventory issue' in text or 'stock issue' in text:
+                    issue_type = 'inventory_issue'
+                elif 'not available' in text:
+                    issue_type = 'not_available'
+                elif 'discontinued' in text:
+                    issue_type = 'discontinued'
+                
+                if issue_type:
+                    flag_order_issue(db_conn, order_id, 'critical', issue_type, email)
+                    results["issues_flagged"] += 1
+                    print(f"[GMAIL] CRITICAL ISSUE: Order {order_id} - {issue_type}")
+                    
+            except Exception as e:
+                results["errors"].append(f"Issue detection error: {e}")
+                try:
+                    db_conn.rollback()
+                except:
+                    pass
+                
+    except Exception as e:
+        results["errors"].append(f"Issue detection search error: {e}")
     
     print(f"[GMAIL] Sync complete: {results}")
     return results
@@ -1096,10 +1177,11 @@ def update_shipment_shipped(conn, order_id, warehouse, tracking_info, source_det
             UPDATE order_shipments 
             SET status = 'shipped',
                 shipped_at = COALESCE(%s, NOW()),
+                clock_started_at = COALESCE(clock_started_at, %s, NOW()),
                 updated_at = NOW(),
                 tracking_number = COALESCE(tracking_number, %s)
             WHERE order_id = %s AND warehouse = %s
-        """, (email_date, tracking_info, order_id, warehouse))
+        """, (email_date, email_date, tracking_info, order_id, warehouse))
         
         cur.execute("""
             INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
@@ -1135,4 +1217,43 @@ def mark_order_canceled(conn, order_id, reason, email=None):
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: marked canceled - {reason}")
+        return True
+
+def flag_order_issue(conn, order_id, alert_level, issue_type, email=None):
+    """
+    Flag an order with an issue (critical or warning).
+    Stores in order_events for the frontend to display.
+    alert_level: 'critical' or 'warning'
+    issue_type: 'out_of_stock', 'backorder', 'no_response', etc.
+    """
+    email_date = parse_email_date(email.get('date')) if email else None
+    
+    with conn.cursor() as cur:
+        # Check if order exists
+        cur.execute("SELECT order_id FROM orders WHERE order_id = %s", (order_id,))
+        if not cur.fetchone():
+            return False
+        
+        # Update order with alert flag
+        cur.execute("""
+            UPDATE orders 
+            SET alert_level = %s,
+                alert_type = %s,
+                alert_at = COALESCE(%s, NOW()),
+                updated_at = NOW()
+            WHERE order_id = %s
+        """, (alert_level, issue_type, email_date, order_id))
+        
+        # Log the issue as an event
+        cur.execute("""
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'issue_flagged', %s, 'gmail_sync', COALESCE(%s, NOW()))
+        """, (order_id, json.dumps({
+            'alert_level': alert_level,
+            'issue_type': issue_type,
+            'email_subject': email.get('subject', '')[:100] if email else ''
+        }), email_date))
+        
+        conn.commit()
+        print(f"[GMAIL] Order {order_id}: flagged {alert_level} - {issue_type}")
         return True

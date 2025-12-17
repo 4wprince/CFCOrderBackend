@@ -1351,6 +1351,63 @@ def add_ai_summary_columns():
             
     return {"status": "ok", "results": results}
 
+@app.post("/admin/add-alert-columns")
+def add_alert_columns():
+    """Add alert_level and alert_type columns to orders table for UI display"""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            results = []
+            
+            # Add alert_level column (warning, critical, or NULL)
+            try:
+                cur.execute("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS alert_level VARCHAR(20)
+                """)
+                conn.commit()
+                results.append("alert_level: added")
+            except Exception as e:
+                conn.rollback()
+                results.append(f"alert_level: {str(e)}")
+            
+            # Add alert_type column (out_of_stock, no_action_after_payment, etc)
+            try:
+                cur.execute("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS alert_type VARCHAR(50)
+                """)
+                conn.commit()
+                results.append("alert_type: added")
+            except Exception as e:
+                conn.rollback()
+                results.append(f"alert_type: {str(e)}")
+            
+            # Add alert_at timestamp
+            try:
+                cur.execute("""
+                    ALTER TABLE orders 
+                    ADD COLUMN IF NOT EXISTS alert_at TIMESTAMP WITH TIME ZONE
+                """)
+                conn.commit()
+                results.append("alert_at: added")
+            except Exception as e:
+                conn.rollback()
+                results.append(f"alert_at: {str(e)}")
+            
+            # Add shipped_clock_started (when 5-day clock began)
+            try:
+                cur.execute("""
+                    ALTER TABLE order_shipments 
+                    ADD COLUMN IF NOT EXISTS clock_started_at TIMESTAMP WITH TIME ZONE
+                """)
+                conn.commit()
+                results.append("clock_started_at: added to shipments")
+            except Exception as e:
+                conn.rollback()
+                results.append(f"clock_started_at: {str(e)}")
+    
+    return {"status": "ok", "results": results}
+
 @app.post("/fix-sku-columns")
 def fix_sku_columns():
     """Fix SKU column lengths in all tables"""
@@ -1674,18 +1731,57 @@ def auto_complete_shipped(days_threshold: int = 5):
 def archive_inactive_orders(days_threshold: int = 5):
     """
     Archive orders with no activity (emails/events) for X days.
-    This is more aggressive than auto-complete-shipped - it doesn't require shipped status.
+    Special rules:
+    - UFP DISTRIBUTION orders: 30-day threshold (they pay slowly)
+    - All gray pills (all shipments delivered): archive immediately
     """
     results = {
         "archived": [],
-        "skipped": []
+        "skipped": [],
+        "all_delivered": []
+    }
+    
+    # Customers with special archive thresholds
+    SPECIAL_THRESHOLDS = {
+        'UFP DISTRIBUTION': 30,
+        'UFP': 30
     }
     
     with get_db() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get all incomplete orders
+            # First: Archive orders where ALL shipments are delivered (gray pills)
             cur.execute("""
-                SELECT o.order_id, o.updated_at, o.order_date,
+                SELECT o.order_id
+                FROM orders o
+                WHERE o.is_complete = false
+                  AND EXISTS (SELECT 1 FROM order_shipments s WHERE s.order_id = o.order_id)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM order_shipments s 
+                      WHERE s.order_id = o.order_id 
+                      AND s.status != 'delivered'
+                  )
+            """)
+            all_delivered = cur.fetchall()
+            
+            for order in all_delivered:
+                cur.execute("""
+                    UPDATE orders 
+                    SET is_complete = true, 
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE order_id = %s
+                """, (order['order_id'],))
+                
+                cur.execute("""
+                    INSERT INTO order_events (order_id, event_type, event_data, source)
+                    VALUES (%s, 'auto_archived', %s, 'system')
+                """, (order['order_id'], json.dumps({'reason': 'all_shipments_delivered'})))
+                
+                results["all_delivered"].append(order['order_id'])
+            
+            # Second: Check activity-based archiving
+            cur.execute("""
+                SELECT o.order_id, o.updated_at, o.order_date, o.company_name, o.customer_name,
                     (SELECT MAX(created_at) FROM order_events WHERE order_id = o.order_id) as last_event
                 FROM orders o
                 WHERE o.is_complete = false
@@ -1696,6 +1792,15 @@ def archive_inactive_orders(days_threshold: int = 5):
             now = datetime.now(timezone.utc)
             
             for order in orders:
+                # Check for special threshold based on customer name
+                customer = (order.get('company_name') or order.get('customer_name') or '').upper()
+                effective_threshold = days_threshold
+                
+                for special_name, special_days in SPECIAL_THRESHOLDS.items():
+                    if special_name.upper() in customer:
+                        effective_threshold = special_days
+                        break
+                
                 # Use the most recent of: last_event, updated_at
                 last_activity = order['last_event'] or order['updated_at'] or order['order_date']
                 
@@ -1706,7 +1811,7 @@ def archive_inactive_orders(days_threshold: int = 5):
                 else:
                     days_since = 999
                 
-                if days_since >= days_threshold:
+                if days_since >= effective_threshold:
                     # Archive this order
                     cur.execute("""
                         UPDATE orders 
@@ -1729,23 +1834,187 @@ def archive_inactive_orders(days_threshold: int = 5):
                         VALUES (%s, 'auto_archived_inactive', %s, 'system')
                     """, (order['order_id'], json.dumps({
                         'days_since_activity': days_since,
-                        'threshold': days_threshold,
+                        'threshold': effective_threshold,
                         'last_activity': last_activity.isoformat() if last_activity else None
                     })))
                     
                     results["archived"].append({
                         "order_id": order['order_id'],
-                        "days_since_activity": days_since
+                        "days_since_activity": days_since,
+                        "threshold_used": effective_threshold
                     })
                 else:
                     results["skipped"].append({
                         "order_id": order['order_id'],
                         "days_since_activity": days_since,
-                        "days_remaining": days_threshold - days_since
+                        "days_remaining": effective_threshold - days_since,
+                        "threshold": effective_threshold
                     })
             
             conn.commit()
             
+    return {"status": "ok", "results": results}
+
+@app.get("/admin/check-alerts")
+def check_alerts():
+    """
+    Check for orders that need alerts:
+    - Orders paid but no action in 24 business hours (warning)
+    - Orders shipped but no payment (warning) 
+    - Orders with no warehouse response in 48 hours (critical after 72hr)
+    - Returns alert counts and flags orders in DB
+    """
+    results = {
+        "warnings": [],
+        "critical": [],
+        "cleared": []
+    }
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            now = datetime.now(timezone.utc)
+            
+            # 1. Payment received but still at "need to order" for 24+ hours
+            cur.execute("""
+                SELECT o.order_id, o.payment_received_at, o.alert_level
+                FROM orders o
+                WHERE o.is_complete = false
+                  AND o.payment_received = true
+                  AND o.payment_received_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM order_shipments s 
+                      WHERE s.order_id = o.order_id 
+                      AND s.status NOT IN ('needs_order')
+                  )
+            """)
+            paid_no_action = cur.fetchall()
+            
+            for order in paid_no_action:
+                payment_at = order['payment_received_at']
+                if payment_at:
+                    if payment_at.tzinfo is None:
+                        payment_at = payment_at.replace(tzinfo=timezone.utc)
+                    hours_since = (now - payment_at).total_seconds() / 3600
+                    
+                    if hours_since >= 24:
+                        alert_level = 'critical' if hours_since >= 48 else 'warning'
+                        cur.execute("""
+                            UPDATE orders SET alert_level = %s, alert_type = 'no_action_after_payment',
+                            alert_at = NOW() WHERE order_id = %s AND (alert_level IS NULL OR alert_level != 'critical')
+                        """, (alert_level, order['order_id']))
+                        results["warnings" if alert_level == 'warning' else "critical"].append({
+                            "order_id": order['order_id'],
+                            "issue": "no_action_after_payment",
+                            "hours_since": round(hours_since, 1)
+                        })
+            
+            # 2. Shipped but no payment received (trusted customer but needs flag)
+            cur.execute("""
+                SELECT o.order_id, o.alert_level
+                FROM orders o
+                WHERE o.is_complete = false
+                  AND o.payment_received = false
+                  AND EXISTS (
+                      SELECT 1 FROM order_shipments s 
+                      WHERE s.order_id = o.order_id 
+                      AND s.status IN ('shipped', 'delivered')
+                  )
+            """)
+            shipped_no_payment = cur.fetchall()
+            
+            for order in shipped_no_payment:
+                # Get the shipped_at date
+                cur.execute("""
+                    SELECT MIN(shipped_at) as shipped_at FROM order_shipments 
+                    WHERE order_id = %s AND shipped_at IS NOT NULL
+                """, (order['order_id'],))
+                ship_row = cur.fetchone()
+                
+                if ship_row and ship_row['shipped_at']:
+                    shipped_at = ship_row['shipped_at']
+                    if shipped_at.tzinfo is None:
+                        shipped_at = shipped_at.replace(tzinfo=timezone.utc)
+                    hours_since = (now - shipped_at).total_seconds() / 3600
+                    
+                    if hours_since >= 24:
+                        cur.execute("""
+                            UPDATE orders SET alert_level = 'warning', alert_type = 'shipped_no_payment',
+                            alert_at = NOW() WHERE order_id = %s AND alert_level IS NULL
+                        """, (order['order_id'],))
+                        results["warnings"].append({
+                            "order_id": order['order_id'],
+                            "issue": "shipped_no_payment",
+                            "hours_since": round(hours_since, 1)
+                        })
+            
+            # 3. No warehouse response - check for orders sent to warehouse with no reply
+            # Look for orders where we sent an email (event) but got no response (no newer email snippet)
+            cur.execute("""
+                SELECT DISTINCT o.order_id, o.alert_level,
+                    (SELECT MAX(created_at) FROM order_events 
+                     WHERE order_id = o.order_id 
+                     AND event_type IN ('email_sent', 'sent_to_warehouse', 'warehouse_order_sent')
+                    ) as last_outbound,
+                    (SELECT MAX(email_date) FROM order_email_snippets 
+                     WHERE order_id = o.order_id
+                    ) as last_inbound
+                FROM orders o
+                WHERE o.is_complete = false
+                  AND EXISTS (
+                      SELECT 1 FROM order_shipments s 
+                      WHERE s.order_id = o.order_id 
+                      AND s.status IN ('needs_order', 'at_warehouse')
+                  )
+            """)
+            pending_orders = cur.fetchall()
+            
+            for order in pending_orders:
+                last_outbound = order['last_outbound']
+                last_inbound = order['last_inbound']
+                
+                # If we sent something and got no response (or response is older)
+                if last_outbound:
+                    if last_outbound.tzinfo is None:
+                        last_outbound = last_outbound.replace(tzinfo=timezone.utc)
+                    
+                    # No inbound at all, or inbound is older than outbound
+                    no_response = False
+                    if not last_inbound:
+                        no_response = True
+                    else:
+                        if last_inbound.tzinfo is None:
+                            last_inbound = last_inbound.replace(tzinfo=timezone.utc)
+                        if last_inbound < last_outbound:
+                            no_response = True
+                    
+                    if no_response:
+                        hours_since = (now - last_outbound).total_seconds() / 3600
+                        if hours_since >= 48:
+                            alert_level = 'critical' if hours_since >= 72 else 'warning'
+                            cur.execute("""
+                                UPDATE orders SET alert_level = %s, alert_type = 'no_warehouse_response',
+                                alert_at = NOW() WHERE order_id = %s 
+                                AND (alert_level IS NULL OR (alert_level = 'warning' AND %s = 'critical'))
+                            """, (alert_level, order['order_id'], alert_level))
+                            results["warnings" if alert_level == 'warning' else "critical"].append({
+                                "order_id": order['order_id'],
+                                "issue": "no_warehouse_response",
+                                "hours_since": round(hours_since, 1)
+                            })
+            
+            # 4. Clear alerts for orders that no longer need them
+            cur.execute("""
+                UPDATE orders SET alert_level = NULL, alert_type = NULL
+                WHERE alert_level IS NOT NULL
+                  AND (is_complete = true OR alert_type = 'no_action_after_payment' 
+                       AND EXISTS (SELECT 1 FROM order_shipments s WHERE s.order_id = orders.order_id AND s.status != 'needs_order'))
+                RETURNING order_id
+            """)
+            cleared = cur.fetchall()
+            results["cleared"] = [r['order_id'] for r in cleared]
+            
+            conn.commit()
+    
     return {"status": "ok", "results": results}
 
 @app.get("/admin/apply-email-rules")
@@ -2733,6 +3002,7 @@ def detect_payment_received(email_subject: str, email_body: str):
 def list_orders(
     status: Optional[str] = None,
     include_complete: bool = False,
+    exclude_test: bool = True,
     limit: int = 200
 ):
     """List orders with optional filters, including shipments"""
@@ -2748,6 +3018,14 @@ def list_orders(
             
             if not include_complete:
                 query += " AND NOT o.is_complete"
+            
+            if exclude_test:
+                # Filter out test orders based on notes or customer name
+                query += """ AND NOT (
+                    LOWER(COALESCE(o.notes, '')) LIKE '%test%' 
+                    OR LOWER(COALESCE(o.company_name, '')) LIKE '%test%'
+                    OR LOWER(COALESCE(o.customer_name, '')) LIKE '%test%'
+                )"""
             
             if status:
                 query += " AND s.current_status = %s"
