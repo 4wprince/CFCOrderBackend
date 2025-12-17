@@ -36,6 +36,14 @@ except ImportError:
     def gmail_configured():
         return False
 
+# Email rules module
+try:
+    from email_rules import process_email, extract_order_number, check_auto_complete
+    email_rules_available = True
+except ImportError:
+    print("[STARTUP] email_rules module not found")
+    email_rules_available = False
+
 # AI Summary module
 try:
     from ai_summary import generate_summary, detect_critical_comments, should_regenerate
@@ -1579,6 +1587,209 @@ def complete_delivered_orders():
             results["orders_completed"] = len(orders_to_complete)
             
     return {"status": "ok", "message": "Delivered orders marked complete", "results": results}
+
+@app.get("/admin/apply-email-rules")
+def apply_email_rules(hours_back: int = 720):
+    """
+    Apply email rules to detect delivered, shipped, canceled orders.
+    Processes email snippets stored in the database.
+    """
+    if not email_rules_available:
+        raise HTTPException(status_code=400, detail="Email rules module not available")
+    
+    results = {
+        "delivered": [],
+        "shipped": [],
+        "canceled": [],
+        "activity": [],
+        "errors": []
+    }
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get recent email snippets
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+            cur.execute("""
+                SELECT order_id, email_from, email_subject, email_snippet, email_date
+                FROM order_email_snippets
+                WHERE email_date > %s
+                ORDER BY email_date DESC
+            """, (cutoff,))
+            snippets = cur.fetchall()
+            
+            print(f"[EMAIL-RULES] Processing {len(snippets)} email snippets")
+            
+            processed_orders = set()
+            
+            for snippet in snippets:
+                try:
+                    order_id = snippet['order_id']
+                    
+                    # Skip if already processed in this run
+                    if order_id in processed_orders:
+                        continue
+                    
+                    result = process_email(
+                        snippet['email_subject'] or '',
+                        snippet['email_snippet'] or '',
+                        snippet['email_date'],
+                        has_attachment=False  # We don't track this in snippets
+                    )
+                    
+                    if result['action'] == 'mark_delivered':
+                        # Mark all shipments as delivered and order as complete
+                        cur.execute("""
+                            UPDATE order_shipments 
+                            SET status = 'delivered', delivered_at = NOW(), updated_at = NOW()
+                            WHERE order_id = %s AND status != 'delivered'
+                        """, (order_id,))
+                        
+                        cur.execute("""
+                            UPDATE orders 
+                            SET is_complete = true, completed_at = NOW(), updated_at = NOW()
+                            WHERE order_id = %s AND is_complete = false
+                        """, (order_id,))
+                        
+                        if cur.rowcount > 0:
+                            results["delivered"].append({
+                                "order_id": order_id,
+                                "details": result['details']
+                            })
+                        processed_orders.add(order_id)
+                        conn.commit()
+                        
+                    elif result['action'] == 'mark_canceled':
+                        # Mark order as complete (canceled)
+                        cur.execute("""
+                            UPDATE orders 
+                            SET is_complete = true, 
+                                completed_at = NOW(), 
+                                notes = CONCAT(COALESCE(notes, ''), ' [CANCELED via email]'),
+                                updated_at = NOW()
+                            WHERE order_id = %s AND is_complete = false
+                        """, (order_id,))
+                        
+                        if cur.rowcount > 0:
+                            results["canceled"].append(order_id)
+                        processed_orders.add(order_id)
+                        conn.commit()
+                        
+                    elif result['action'] == 'mark_shipped':
+                        # Mark shipments as shipped
+                        tracking = result['details'].get('tracking')
+                        ship_method = result['details'].get('ship_method')
+                        
+                        update_fields = ["status = 'shipped'", "shipped_at = COALESCE(shipped_at, NOW())", "updated_at = NOW()"]
+                        params = []
+                        
+                        if tracking:
+                            update_fields.append("tracking_number = %s")
+                            params.append(tracking)
+                        if ship_method:
+                            update_fields.append("ship_method = %s")
+                            params.append(ship_method)
+                        
+                        params.append(order_id)
+                        
+                        cur.execute(f"""
+                            UPDATE order_shipments 
+                            SET {', '.join(update_fields)}
+                            WHERE order_id = %s AND status NOT IN ('shipped', 'delivered')
+                        """, tuple(params))
+                        
+                        if cur.rowcount > 0:
+                            results["shipped"].append({
+                                "order_id": order_id,
+                                "tracking": tracking,
+                                "ship_method": ship_method
+                            })
+                        processed_orders.add(order_id)
+                        conn.commit()
+                        
+                except Exception as e:
+                    results["errors"].append(f"Order {snippet.get('order_id')}: {str(e)}")
+                    try:
+                        conn.rollback()
+                    except:
+                        pass
+    
+    return {"status": "ok", "results": results}
+
+@app.get("/admin/auto-complete-shipped")
+def auto_complete_shipped_orders():
+    """
+    Auto-complete orders that were shipped 5+ days ago with no recent email activity.
+    The 5-day clock resets if new emails arrive.
+    """
+    results = {
+        "completed": [],
+        "skipped": []
+    }
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Find orders with shipped shipments that aren't complete
+            cur.execute("""
+                SELECT DISTINCT o.order_id, 
+                       MAX(s.shipped_at) as last_shipped,
+                       MAX(e.email_date) as last_email
+                FROM orders o
+                JOIN order_shipments s ON o.order_id = s.order_id
+                LEFT JOIN order_email_snippets e ON o.order_id = e.order_id
+                WHERE o.is_complete = false
+                  AND s.status = 'shipped'
+                GROUP BY o.order_id
+            """)
+            
+            orders = cur.fetchall()
+            now = datetime.now(timezone.utc)
+            
+            for order in orders:
+                order_id = order['order_id']
+                last_shipped = order['last_shipped']
+                last_email = order['last_email']
+                
+                if not last_shipped:
+                    continue
+                
+                # Determine last activity (shipped or email, whichever is later)
+                last_activity = last_shipped
+                if last_email and last_email > last_shipped:
+                    last_activity = last_email
+                
+                # Calculate days since last activity
+                if last_activity.tzinfo is None:
+                    last_activity = last_activity.replace(tzinfo=timezone.utc)
+                
+                days_since = (now - last_activity).days
+                
+                if days_since >= 5:
+                    # Mark as complete
+                    cur.execute("""
+                        UPDATE order_shipments 
+                        SET status = 'delivered', delivered_at = NOW(), updated_at = NOW()
+                        WHERE order_id = %s AND status = 'shipped'
+                    """, (order_id,))
+                    
+                    cur.execute("""
+                        UPDATE orders 
+                        SET is_complete = true, completed_at = NOW(), updated_at = NOW()
+                        WHERE order_id = %s
+                    """, (order_id,))
+                    
+                    results["completed"].append({
+                        "order_id": order_id,
+                        "days_since_activity": days_since
+                    })
+                    conn.commit()
+                else:
+                    results["skipped"].append({
+                        "order_id": order_id,
+                        "days_since_activity": days_since,
+                        "days_remaining": 5 - days_since
+                    })
+    
+    return {"status": "ok", "results": results}
 
 # =============================================================================
 # B2BWAVE SYNC ENDPOINTS
