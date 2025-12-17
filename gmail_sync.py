@@ -12,6 +12,77 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+
+def parse_email_date(date_str):
+    """Parse email date header into datetime. Returns None if parsing fails."""
+    if not date_str:
+        return None
+    try:
+        return parsedate_to_datetime(date_str)
+    except Exception:
+        # Try some common formats
+        for fmt in ['%a, %d %b %Y %H:%M:%S %z', '%d %b %Y %H:%M:%S %z', '%Y-%m-%d %H:%M:%S']:
+            try:
+                return datetime.strptime(date_str.strip(), fmt)
+            except:
+                continue
+        return None
+
+def reactivate_if_archived(conn, order_id, email, reason):
+    """
+    Check if order is archived (is_complete=true) and reactivate it.
+    This handles cases where customers email about completed orders.
+    Returns True if order was reactivated, False otherwise.
+    """
+    with conn.cursor() as cur:
+        # Check if order exists and is complete
+        cur.execute("""
+            SELECT is_complete, current_status FROM orders WHERE order_id = %s
+        """, (order_id,))
+        row = cur.fetchone()
+        
+        if not row:
+            return False  # Order doesn't exist
+        
+        is_complete, current_status = row
+        
+        if not is_complete:
+            return False  # Order is already active, nothing to do
+        
+        # Reactivate the order
+        email_date = parse_email_date(email.get('date')) if email else None
+        
+        cur.execute("""
+            UPDATE orders 
+            SET is_complete = FALSE,
+                completed_at = NULL,
+                current_status = 'awaiting_shipment',
+                updated_at = NOW()
+            WHERE order_id = %s
+        """, (order_id,))
+        
+        # Reset shipments to ready_ship status
+        cur.execute("""
+            UPDATE order_shipments 
+            SET status = 'ready_ship',
+                updated_at = NOW()
+            WHERE order_id = %s
+        """, (order_id,))
+        
+        # Log the reactivation
+        cur.execute("""
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'order_reactivated', %s, 'gmail_sync', COALESCE(%s, NOW()))
+        """, (order_id, json.dumps({
+            'reason': reason,
+            'email_subject': email.get('subject', '')[:100] if email else '',
+            'previous_status': current_status
+        }), email_date))
+        
+        conn.commit()
+        print(f"[GMAIL] Order {order_id}: REACTIVATED from archive - {reason}")
+        return True
 
 # Gmail API Config - loaded from environment
 GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "").strip()
@@ -311,6 +382,7 @@ def run_gmail_sync(db_conn, hours_back=2):
         "saia_delivered": 0,
         "shipped_detected": 0,
         "canceled": 0,
+        "reactivated": 0,
         "errors": []
     }
     
@@ -546,7 +618,7 @@ def run_gmail_sync(db_conn, hours_back=2):
                 mpo_match = re.search(r'MPO\s+(\d{4,5})', text, re.IGNORECASE)
                 if mpo_match:
                     order_id = mpo_match.group(1)
-                    update_shipment_delivered(db_conn, order_id, None, pro_number, 'rl_delivered_email')
+                    update_shipment_delivered(db_conn, order_id, None, pro_number, 'rl_delivered_email', email)
                     results["rl_delivered"] += 1
                     print(f"[GMAIL] R+L Delivered: Order {order_id}")
                 else:
@@ -554,7 +626,7 @@ def run_gmail_sync(db_conn, hours_back=2):
                     order_match = re.search(r'\b(5\d{3})\b', text)
                     if order_match:
                         order_id = order_match.group(1)
-                        update_shipment_delivered(db_conn, order_id, None, pro_number, 'rl_delivered_email')
+                        update_shipment_delivered(db_conn, order_id, None, pro_number, 'rl_delivered_email', email)
                         results["rl_delivered"] += 1
                         print(f"[GMAIL] R+L Delivered (inferred): Order {order_id}")
                         
@@ -596,10 +668,10 @@ def run_gmail_sync(db_conn, hours_back=2):
                     if order_id:
                         # Check if delivered
                         if 'delivered' in text.lower():
-                            update_shipment_delivered(db_conn, order_id, None, f"SAIA {saia_tracking}", 'saia_delivered')
+                            update_shipment_delivered(db_conn, order_id, None, f"SAIA {saia_tracking}", 'saia_delivered', email)
                             results["saia_delivered"] += 1
                         else:
-                            update_shipment_shipped(db_conn, order_id, None, f"SAIA {saia_tracking}", 'saia_tracking')
+                            update_shipment_shipped(db_conn, order_id, None, f"SAIA {saia_tracking}", 'saia_tracking', email)
                             
             except Exception as e:
                 results["errors"].append(f"SAIA error: {e}")
@@ -667,7 +739,7 @@ def run_gmail_sync(db_conn, hours_back=2):
                     source = 'attachment_shipped'
                 
                 if source:
-                    update_shipment_shipped(db_conn, order_id, None, tracking_info, source)
+                    update_shipment_shipped(db_conn, order_id, None, tracking_info, source, email)
                     results["shipped_detected"] += 1
                     
             except Exception as e:
@@ -706,7 +778,7 @@ def run_gmail_sync(db_conn, hours_back=2):
                 
                 order_id = extract_order_id(email['subject'] + ' ' + email['body'])
                 if order_id:
-                    mark_order_canceled(db_conn, order_id, 'Email mentioned cancel')
+                    mark_order_canceled(db_conn, order_id, 'Email mentioned cancel', email)
                     results["canceled"] += 1
                     
             except Exception as e:
@@ -718,6 +790,41 @@ def run_gmail_sync(db_conn, hours_back=2):
                 
     except Exception as e:
         results["errors"].append(f"Cancel search error: {e}")
+    
+    # Clean transaction state
+    try:
+        db_conn.rollback()
+    except:
+        pass
+    
+    # 10. Reactivate archived orders with recent email activity
+    # Only look at last 48 hours to avoid reactivating old orders
+    results["reactivated"] = 0
+    try:
+        recent_filter = "newer_than:48h"
+        messages = search_emails(f'{recent_filter} (order OR PO OR #)')
+        print(f"[GMAIL] Checking {len(messages)} recent emails for archived order reactivation")
+        
+        for msg in messages:
+            try:
+                email = get_email_content(msg['id'])
+                if not email:
+                    continue
+                
+                order_id = extract_order_id(email['subject'] + ' ' + email['body'])
+                if order_id:
+                    if reactivate_if_archived(db_conn, order_id, email, 'New email received'):
+                        results["reactivated"] += 1
+                        
+            except Exception as e:
+                results["errors"].append(f"Reactivation error: {e}")
+                try:
+                    db_conn.rollback()
+                except:
+                    pass
+                
+    except Exception as e:
+        results["errors"].append(f"Reactivation search error: {e}")
     
     print(f"[GMAIL] Sync complete: {results}")
     return results
@@ -740,19 +847,22 @@ def update_order_payment_link_sent(conn, order_id, email):
         if row[0]:  # Already marked
             return False
         
+        # Parse email date
+        email_date = parse_email_date(email.get('date'))
+        
         cur.execute("""
             UPDATE orders SET 
                 payment_link_sent = TRUE,
-                payment_link_sent_at = NOW(),
+                payment_link_sent_at = COALESCE(%s, NOW()),
                 updated_at = NOW()
             WHERE order_id = %s
-        """, (order_id,))
+        """, (email_date, order_id))
         
-        # Log event
+        # Log event with actual email date
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'payment_link_sent', %s, 'gmail_sync')
-        """, (order_id, json.dumps({'subject': email['subject'][:100]})))
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'payment_link_sent', %s, 'gmail_sync', COALESCE(%s, NOW()))
+        """, (order_id, json.dumps({'subject': email['subject'][:100], 'email_date': email.get('date', '')}), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: payment link sent")
@@ -761,6 +871,8 @@ def update_order_payment_link_sent(conn, order_id, email):
 def match_payment_to_order(conn, amount, customer_name, email):
     """Try to match a Square payment to an order"""
     from psycopg2.extras import RealDictCursor
+    
+    email_date = parse_email_date(email.get('date'))
     
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Try to find matching order by amount and customer name
@@ -786,20 +898,20 @@ def match_payment_to_order(conn, amount, customer_name, email):
                 cur.execute("""
                     UPDATE orders SET 
                         payment_received = TRUE,
-                        payment_received_at = NOW(),
+                        payment_received_at = COALESCE(%s, NOW()),
                         payment_amount = %s,
                         updated_at = NOW()
                     WHERE order_id = %s
-                """, (amount, order['order_id']))
+                """, (email_date, amount, order['order_id']))
                 
                 cur.execute("""
-                    INSERT INTO order_events (order_id, event_type, event_data, source)
-                    VALUES (%s, 'payment_received', %s, 'gmail_sync')
+                    INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+                    VALUES (%s, 'payment_received', %s, 'gmail_sync', COALESCE(%s, NOW()))
                 """, (order['order_id'], json.dumps({
                     'amount': amount, 
                     'customer': customer_name,
                     'subject': email['subject'][:100]
-                })))
+                }), email_date))
                 
                 conn.commit()
                 print(f"[GMAIL] Order {order['order_id']}: payment ${amount} received from {customer_name}")
@@ -810,6 +922,8 @@ def match_payment_to_order(conn, amount, customer_name, email):
 
 def update_order_rl_quote(conn, order_id, quote_no, email):
     """Update order with RL quote number"""
+    email_date = parse_email_date(email.get('date')) if email else None
+    
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE orders SET 
@@ -819,9 +933,9 @@ def update_order_rl_quote(conn, order_id, quote_no, email):
         """, (quote_no, order_id))
         
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'rl_quote_captured', %s, 'gmail_sync')
-        """, (order_id, json.dumps({'quote_no': quote_no})))
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'rl_quote_captured', %s, 'gmail_sync', COALESCE(%s, NOW()))
+        """, (order_id, json.dumps({'quote_no': quote_no}), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: RL quote {quote_no}")
@@ -829,6 +943,8 @@ def update_order_rl_quote(conn, order_id, quote_no, email):
 
 def update_order_tracking(conn, order_id, tracking_no, carrier, email):
     """Update order with tracking number"""
+    email_date = parse_email_date(email.get('date')) if email else None
+    
     with conn.cursor() as cur:
         tracking_text = f"{carrier} {tracking_no}" if carrier != 'PRO' else f"R+L PRO {tracking_no}"
         
@@ -841,9 +957,9 @@ def update_order_tracking(conn, order_id, tracking_no, carrier, email):
         """, (tracking_text, carrier, tracking_no, order_id))
         
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'tracking_captured', %s, 'gmail_sync')
-        """, (order_id, json.dumps({'tracking': tracking_no, 'carrier': carrier})))
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'tracking_captured', %s, 'gmail_sync', COALESCE(%s, NOW()))
+        """, (order_id, json.dumps({'tracking': tracking_no, 'carrier': carrier}), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: {carrier} tracking {tracking_no}")
@@ -851,6 +967,8 @@ def update_order_tracking(conn, order_id, tracking_no, carrier, email):
 
 def update_li_shipment_delivered(conn, order_id, email):
     """Mark LI shipment as delivered when invoice received"""
+    email_date = parse_email_date(email.get('date')) if email else None
+    
     with conn.cursor() as cur:
         # Check if shipment exists for this order with LI warehouse
         cur.execute("""
@@ -874,26 +992,28 @@ def update_li_shipment_delivered(conn, order_id, email):
         cur.execute("""
             UPDATE order_shipments 
             SET status = 'delivered',
-                delivered_at = NOW(),
+                delivered_at = COALESCE(%s, NOW()),
                 updated_at = NOW()
             WHERE order_id = %s AND warehouse = 'LI'
-        """, (order_id,))
+        """, (email_date, order_id))
         
-        # Log event
+        # Log event with actual email date
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'li_invoice_received', %s, 'gmail_sync')
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'li_invoice_received', %s, 'gmail_sync', COALESCE(%s, NOW()))
         """, (order_id, json.dumps({
             'email_subject': email.get('subject', ''),
             'warehouse': 'LI'
-        })))
+        }), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: LI shipment marked delivered (invoice received)")
         return True
 
-def update_shipment_delivered(conn, order_id, warehouse, tracking_info, source_detail):
+def update_shipment_delivered(conn, order_id, warehouse, tracking_info, source_detail, email=None):
     """Mark any shipment as delivered"""
+    email_date = parse_email_date(email.get('date')) if email else None
+    
     with conn.cursor() as cur:
         # Check if shipment exists
         cur.execute("""
@@ -924,27 +1044,29 @@ def update_shipment_delivered(conn, order_id, warehouse, tracking_info, source_d
         cur.execute("""
             UPDATE order_shipments 
             SET status = 'delivered',
-                delivered_at = NOW(),
+                delivered_at = COALESCE(%s, NOW()),
                 updated_at = NOW(),
                 tracking_number = COALESCE(tracking_number, %s)
             WHERE order_id = %s AND warehouse = %s
-        """, (tracking_info, order_id, warehouse))
+        """, (email_date, tracking_info, order_id, warehouse))
         
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'shipment_delivered', %s, 'gmail_sync')
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'shipment_delivered', %s, 'gmail_sync', COALESCE(%s, NOW()))
         """, (order_id, json.dumps({
             'warehouse': warehouse,
             'tracking': tracking_info,
             'source': source_detail
-        })))
+        }), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: {warehouse} shipment marked delivered")
         return True
 
-def update_shipment_shipped(conn, order_id, warehouse, tracking_info, source_detail):
+def update_shipment_shipped(conn, order_id, warehouse, tracking_info, source_detail, email=None):
     """Mark shipment as shipped"""
+    email_date = parse_email_date(email.get('date')) if email else None
+    
     with conn.cursor() as cur:
         # If warehouse specified, use it
         if warehouse:
@@ -975,41 +1097,43 @@ def update_shipment_shipped(conn, order_id, warehouse, tracking_info, source_det
         cur.execute("""
             UPDATE order_shipments 
             SET status = 'shipped',
-                shipped_at = NOW(),
+                shipped_at = COALESCE(%s, NOW()),
                 updated_at = NOW(),
                 tracking_number = COALESCE(tracking_number, %s)
             WHERE order_id = %s AND warehouse = %s
-        """, (tracking_info, order_id, warehouse))
+        """, (email_date, tracking_info, order_id, warehouse))
         
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'shipment_shipped', %s, 'gmail_sync')
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'shipment_shipped', %s, 'gmail_sync', COALESCE(%s, NOW()))
         """, (order_id, json.dumps({
             'warehouse': warehouse,
             'tracking': tracking_info,
             'source': source_detail
-        })))
+        }), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: {warehouse} shipment marked shipped")
         return True
 
-def mark_order_canceled(conn, order_id, reason):
+def mark_order_canceled(conn, order_id, reason, email=None):
     """Mark order as canceled"""
+    email_date = parse_email_date(email.get('date')) if email else None
+    
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE orders 
             SET is_complete = TRUE,
-                completed_at = NOW(),
+                completed_at = COALESCE(%s, NOW()),
                 notes = CONCAT(COALESCE(notes, ''), ' [CANCELED: ', %s, ']'),
                 updated_at = NOW()
             WHERE order_id = %s
-        """, (reason, order_id))
+        """, (email_date, reason, order_id))
         
         cur.execute("""
-            INSERT INTO order_events (order_id, event_type, event_data, source)
-            VALUES (%s, 'order_canceled', %s, 'gmail_sync')
-        """, (order_id, json.dumps({'reason': reason})))
+            INSERT INTO order_events (order_id, event_type, event_data, source, created_at)
+            VALUES (%s, 'order_canceled', %s, 'gmail_sync', COALESCE(%s, NOW()))
+        """, (order_id, json.dumps({'reason': reason}), email_date))
         
         conn.commit()
         print(f"[GMAIL] Order {order_id}: marked canceled - {reason}")

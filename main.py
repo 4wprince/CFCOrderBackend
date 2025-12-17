@@ -1671,6 +1671,85 @@ def auto_complete_shipped(days_threshold: int = 5):
             
     return {"status": "ok", "results": results}
 
+@app.get("/admin/archive-inactive-orders")
+def archive_inactive_orders(days_threshold: int = 5):
+    """
+    Archive orders with no activity (emails/events) for X days.
+    This is more aggressive than auto-complete-shipped - it doesn't require shipped status.
+    """
+    results = {
+        "archived": [],
+        "skipped": []
+    }
+    
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get all incomplete orders
+            cur.execute("""
+                SELECT o.order_id, o.updated_at, o.order_date,
+                    (SELECT MAX(created_at) FROM order_events WHERE order_id = o.order_id) as last_event
+                FROM orders o
+                WHERE o.is_complete = false
+                ORDER BY o.order_date
+            """)
+            orders = cur.fetchall()
+            
+            now = datetime.now(timezone.utc)
+            
+            for order in orders:
+                # Use the most recent of: last_event, updated_at
+                last_activity = order['last_event'] or order['updated_at'] or order['order_date']
+                
+                if last_activity:
+                    if last_activity.tzinfo is None:
+                        last_activity = last_activity.replace(tzinfo=timezone.utc)
+                    days_since = (now - last_activity).days
+                else:
+                    days_since = 999
+                
+                if days_since >= days_threshold:
+                    # Archive this order
+                    cur.execute("""
+                        UPDATE orders 
+                        SET is_complete = true, 
+                            completed_at = NOW(),
+                            current_status = 'complete',
+                            updated_at = NOW()
+                        WHERE order_id = %s
+                    """, (order['order_id'],))
+                    
+                    # Mark all shipments as delivered (assume done if no activity)
+                    cur.execute("""
+                        UPDATE order_shipments 
+                        SET status = 'delivered',
+                            delivered_at = COALESCE(delivered_at, NOW())
+                        WHERE order_id = %s AND status != 'delivered'
+                    """, (order['order_id'],))
+                    
+                    cur.execute("""
+                        INSERT INTO order_events (order_id, event_type, event_data, source)
+                        VALUES (%s, 'auto_archived_inactive', %s, 'system')
+                    """, (order['order_id'], json.dumps({
+                        'days_since_activity': days_since,
+                        'threshold': days_threshold,
+                        'last_activity': last_activity.isoformat() if last_activity else None
+                    })))
+                    
+                    results["archived"].append({
+                        "order_id": order['order_id'],
+                        "days_since_activity": days_since
+                    })
+                else:
+                    results["skipped"].append({
+                        "order_id": order['order_id'],
+                        "days_since_activity": days_since,
+                        "days_remaining": days_threshold - days_since
+                    })
+            
+            conn.commit()
+            
+    return {"status": "ok", "results": results}
+
 @app.get("/admin/apply-email-rules")
 def apply_email_rules(hours_back: int = 720):
     """
