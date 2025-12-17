@@ -1,4 +1,4 @@
-"""
+﻿"""
 CFC Order Workflow Backend - v5.9.1
 All parsing/logic server-side. B2BWave API integration for clean order data.
 Auto-sync every 15 minutes. Gmail email scanning for status updates.
@@ -792,7 +792,7 @@ def generate_order_summary(order_id: str) -> str:
     prompt = f"""Write a brief order status summary.
 
 Rules:
-- Use simple bullet points (• symbol)
+- Use simple bullet points (â€¢ symbol)
 - NO headers, NO bold text, NO markdown formatting
 - Only include notable information (special requests, issues, credits)
 - Skip obvious info (order total, warehouse names) unless relevant to an issue
@@ -2630,7 +2630,7 @@ def generate_comprehensive_summary(order_id: str):
     prompt = f"""Analyze this order and provide a comprehensive summary with up to 15 bullet points.
 
 RULES:
-- Use bullet points (• symbol)
+- Use bullet points (â€¢ symbol)
 - NO headers, NO bold text, NO markdown
 - Be thorough but concise - include ALL relevant details
 - Include timeline of key events if applicable
@@ -4063,5 +4063,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
 
-#   P r o d u c t i o n   s y n c   1 2 / 1 7 / 2 0 2 5   1 6 : 5 5 : 2 5  
- 
+
