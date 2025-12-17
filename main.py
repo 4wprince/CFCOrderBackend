@@ -4063,3 +4063,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
 
+#   P r o d u c t i o n   s y n c   1 2 / 1 7 / 2 0 2 5   1 6 : 5 5 : 2 5  
+ 
